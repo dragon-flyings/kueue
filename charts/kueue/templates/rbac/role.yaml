@@ -31,6 +31,24 @@ rules:
   - apiGroups:
       - ""
     resources:
+      - pods
+    verbs:
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - pods/status
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+      - ""
+    resources:
       - secrets
     verbs:
       - get
@@ -117,6 +135,40 @@ rules:
   - apiGroups:
       - kubeflow.org
     resources:
+      - mxjobs
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeflow.org
+    resources:
+      - mxjobs/status
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - kubeflow.org
+    resources:
+      - paddlejobs
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeflow.org
+    resources:
+      - paddlejobs/status
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - kubeflow.org
+    resources:
       - pytorchjobs
     verbs:
       - get
@@ -145,6 +197,23 @@ rules:
       - kubeflow.org
     resources:
       - tfjobs/status
+    verbs:
+      - get
+      - update
+  - apiGroups:
+      - kubeflow.org
+    resources:
+      - xgboostjobs
+    verbs:
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - kubeflow.org
+    resources:
+      - xgboostjobs/status
     verbs:
       - get
       - update
@@ -242,6 +311,14 @@ rules:
       - resourceflavors/finalizers
     verbs:
       - update
+  - apiGroups:
+      - kueue.x-k8s.io
+    resources:
+      - workloadpriorityclasses
+    verbs:
+      - get
+      - list
+      - watch
   - apiGroups:
       - kueue.x-k8s.io
     resources:

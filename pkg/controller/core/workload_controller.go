@@ -39,10 +39,9 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/cache"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
 	"sigs.k8s.io/kueue/pkg/queue"
-	"sigs.k8s.io/kueue/pkg/util/limitrange"
-	"sigs.k8s.io/kueue/pkg/util/resource"
 	"sigs.k8s.io/kueue/pkg/util/slices"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
@@ -134,6 +133,17 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	if rejectedChecks := workload.GetRejectedChecks(&wl); len(rejectedChecks) > 0 {
+		// Finish the workload
+		log.V(3).Info("Workload has Rejected admission checks, Finish with failure")
+		err := workload.UpdateStatus(ctx, r.client, &wl, kueue.WorkloadFinished,
+			metav1.ConditionTrue,
+			"AdmissionChecksRejected",
+			fmt.Sprintf("Admission checks %v are rejected", rejectedChecks),
+			constants.KueueName)
+		return ctrl.Result{}, err
+	}
+
 	cqName, cqOk := r.queues.ClusterQueueForWorkload(&wl)
 	if cqOk {
 		if updated, err := r.reconcileSyncAdmissionChecks(ctx, &wl, cqName); updated || err != nil {
@@ -206,19 +216,18 @@ func (r *WorkloadReconciler) reconcileSyncAdmissionChecks(ctx context.Context, w
 	return false, nil
 }
 
-func syncAdmissionCheckConditions(conds []metav1.Condition, queueChecks []string) ([]metav1.Condition, bool) {
+func syncAdmissionCheckConditions(conds []kueue.AdmissionCheckState, queueChecks []string) ([]kueue.AdmissionCheckState, bool) {
 	if len(queueChecks) == 0 {
 		return nil, len(conds) > 0
 	}
 
 	shouldUpdate := false
-	currentChecks := slices.ToRefMap(conds, func(c *metav1.Condition) string { return c.Type })
+	currentChecks := slices.ToRefMap(conds, func(c *kueue.AdmissionCheckState) string { return c.Name })
 	for _, t := range queueChecks {
 		if _, found := currentChecks[t]; !found {
-			apimeta.SetStatusCondition(&conds, metav1.Condition{
-				Type:   t,
-				Status: metav1.ConditionUnknown,
-				Reason: kueue.CheckStatePending,
+			workload.SetAdmissionCheckState(&conds, kueue.AdmissionCheckState{
+				Name:  t,
+				State: kueue.CheckStatePending,
 			})
 			shouldUpdate = true
 		}
@@ -226,12 +235,12 @@ func syncAdmissionCheckConditions(conds []metav1.Condition, queueChecks []string
 
 	// if the workload conditions length is bigger, then some cleanup should be done
 	if len(conds) > len(queueChecks) {
-		newConds := make([]metav1.Condition, 0, len(queueChecks))
+		newConds := make([]kueue.AdmissionCheckState, 0, len(queueChecks))
 		queueChecksSet := sets.New(queueChecks...)
 		shouldUpdate = true
 		for i := range conds {
 			c := &conds[i]
-			if queueChecksSet.Has(c.Type) {
+			if queueChecksSet.Has(c.Name) {
 				newConds = append(newConds, *c)
 			}
 		}
@@ -272,8 +281,9 @@ func (r *WorkloadReconciler) Create(e event.CreateEvent) bool {
 		return true
 	}
 
+	ctx := ctrl.LoggerInto(context.Background(), log)
 	wlCopy := wl.DeepCopy()
-	r.adjustResources(log, wlCopy)
+	workload.AdjustResources(ctx, r.client, wlCopy)
 
 	if !workload.HasQuotaReservation(wl) {
 		if !r.queues.AddOrUpdateWorkload(wlCopy) {
@@ -359,7 +369,7 @@ func (r *WorkloadReconciler) Update(e event.UpdateEvent) bool {
 
 	wlCopy := wl.DeepCopy()
 	// We do not handle old workload here as it will be deleted or replaced by new one anyway.
-	r.adjustResources(log, wlCopy)
+	workload.AdjustResources(ctrl.LoggerInto(ctx, log), r.client, wlCopy)
 
 	switch {
 	case status == finished:
@@ -478,81 +488,6 @@ func workloadStatus(w *kueue.Workload) string {
 	return pending
 }
 
-// We do not verify Pod's RuntimeClass legality here as this will be performed in admission controller.
-// As a result, the pod's Overhead is not always correct. E.g. if we set a non-existent runtime class name to
-// `pod.Spec.RuntimeClassName` and we also set the `pod.Spec.Overhead`, in real world, the pod creation will be
-// rejected due to the mismatch with RuntimeClass. However, in the future we assume that they are correct.
-func (r *WorkloadReconciler) handlePodOverhead(log logr.Logger, wl *kueue.Workload) {
-	ctx := context.Background()
-
-	for i := range wl.Spec.PodSets {
-		podSpec := &wl.Spec.PodSets[i].Template.Spec
-		if podSpec.RuntimeClassName != nil && len(podSpec.Overhead) == 0 {
-			var runtimeClass nodev1.RuntimeClass
-			if err := r.client.Get(ctx, types.NamespacedName{Name: *podSpec.RuntimeClassName}, &runtimeClass); err != nil {
-				log.Error(err, "Could not get RuntimeClass")
-				continue
-			}
-			if runtimeClass.Overhead != nil {
-				podSpec.Overhead = runtimeClass.Overhead.PodFixed
-			}
-		}
-	}
-}
-
-func (r *WorkloadReconciler) handlePodLimitRange(log logr.Logger, wl *kueue.Workload) {
-	ctx := context.TODO()
-	// get the list of limit ranges
-	var list corev1.LimitRangeList
-	if err := r.client.List(ctx, &list, &client.ListOptions{Namespace: wl.Namespace}, client.MatchingFields{indexer.LimitRangeHasContainerType: "true"}); err != nil {
-		log.Error(err, "Could not list LimitRanges")
-		return
-	}
-
-	if len(list.Items) == 0 {
-		return
-	}
-	summary := limitrange.Summarize(list.Items...)
-	containerLimits, found := summary[corev1.LimitTypeContainer]
-	if !found {
-		return
-	}
-
-	for pi := range wl.Spec.PodSets {
-		pod := &wl.Spec.PodSets[pi].Template.Spec
-		for ci := range pod.InitContainers {
-			res := &pod.InitContainers[ci].Resources
-			res.Limits = resource.MergeResourceListKeepFirst(res.Limits, containerLimits.Default)
-			res.Requests = resource.MergeResourceListKeepFirst(res.Requests, containerLimits.DefaultRequest)
-		}
-		for ci := range pod.Containers {
-			res := &pod.Containers[ci].Resources
-			res.Limits = resource.MergeResourceListKeepFirst(res.Limits, containerLimits.Default)
-			res.Requests = resource.MergeResourceListKeepFirst(res.Requests, containerLimits.DefaultRequest)
-		}
-	}
-}
-
-func (r *WorkloadReconciler) handleLimitsToRequests(wl *kueue.Workload) {
-	for pi := range wl.Spec.PodSets {
-		pod := &wl.Spec.PodSets[pi].Template.Spec
-		for ci := range pod.InitContainers {
-			res := &pod.InitContainers[ci].Resources
-			res.Requests = resource.MergeResourceListKeepFirst(res.Requests, res.Limits)
-		}
-		for ci := range pod.Containers {
-			res := &pod.Containers[ci].Resources
-			res.Requests = resource.MergeResourceListKeepFirst(res.Requests, res.Limits)
-		}
-	}
-}
-
-func (r *WorkloadReconciler) adjustResources(log logr.Logger, wl *kueue.Workload) {
-	r.handlePodOverhead(log, wl)
-	r.handlePodLimitRange(log, wl)
-	r.handleLimitsToRequests(wl)
-}
-
 type resourceUpdatesHandler struct {
 	r *WorkloadReconciler
 }
@@ -609,7 +544,7 @@ func (h *resourceUpdatesHandler) queueReconcileForPending(ctx context.Context, _
 		wlCopy := w.DeepCopy()
 		log := log.WithValues("workload", klog.KObj(wlCopy))
 		log.V(5).Info("Queue reconcile for")
-		h.r.adjustResources(log, wlCopy)
+		workload.AdjustResources(ctrl.LoggerInto(ctx, log), h.r.client, wlCopy)
 		if !h.r.queues.AddOrUpdateWorkload(wlCopy) {
 			log.V(2).Info("Queue for workload didn't exist")
 		}

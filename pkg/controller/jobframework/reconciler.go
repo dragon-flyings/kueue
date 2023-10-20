@@ -17,6 +17,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,9 +40,8 @@ import (
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/util/equality"
 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
-	"sigs.k8s.io/kueue/pkg/util/maps"
 	utilpriority "sigs.k8s.io/kueue/pkg/util/priority"
-	"sigs.k8s.io/kueue/pkg/util/slices"
+	utilslices "sigs.k8s.io/kueue/pkg/util/slices"
 	"sigs.k8s.io/kueue/pkg/workload"
 )
 
@@ -55,6 +56,7 @@ var (
 	ErrNoMatchingWorkloads   = errors.New("no matching workloads")
 	ErrExtraWorkloads        = errors.New("extra workloads")
 	ErrInvalidPodsetInfo     = errors.New("invalid podset infos")
+	ErrInvalidPodSetUpdate   = errors.New("invalid admission check PodSetUpdate")
 )
 
 // JobReconciler reconciles a GenericJob object
@@ -69,6 +71,8 @@ type Options struct {
 	ManageJobsWithoutQueueName bool
 	WaitForPodsReady           bool
 	KubeServerVersion          *kubeversion.ServerVersionFetcher
+	PodNamespaceSelector       *metav1.LabelSelector
+	PodSelector                *metav1.LabelSelector
 }
 
 // Option configures the reconciler.
@@ -97,6 +101,22 @@ func WithKubeServerVersion(v *kubeversion.ServerVersionFetcher) Option {
 	}
 }
 
+// WithPodNamespaceSelector adds rules to reconcile pods only in particular
+// namespaces.
+func WithPodNamespaceSelector(s *metav1.LabelSelector) Option {
+	return func(o *Options) {
+		o.PodNamespaceSelector = s
+	}
+}
+
+// WithPodSelector adds rules to reconcile pods only with particular
+// labels.
+func WithPodSelector(s *metav1.LabelSelector) Option {
+	return func(o *Options) {
+		o.PodSelector = s
+	}
+}
+
 var DefaultOptions = Options{}
 
 func NewReconciler(
@@ -122,6 +142,12 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 	ctx = ctrl.LoggerInto(ctx, log)
 
 	err := r.client.Get(ctx, req.NamespacedName, object)
+
+	if jws, implements := job.(JobWithSkip); implements {
+		if jws.Skip() {
+			return ctrl.Result{}, nil
+		}
+	}
 
 	if apierrors.IsNotFound(err) || !object.GetDeletionTimestamp().IsZero() {
 		workloads := kueue.WorkloadList{}
@@ -217,10 +243,16 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 
 	// 2. handle job is finished.
 	if condition, finished := job.Finished(); finished && wl != nil {
+		// Execute job finalization logic
+		if err := r.finalizeJob(ctx, job); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		err := workload.UpdateStatus(ctx, r.client, wl, condition.Type, condition.Status, condition.Reason, condition.Message, constants.JobControllerName)
 		if err != nil {
 			log.Error(err, "Updating workload status")
 		}
+
 		return ctrl.Result{}, nil
 	}
 
@@ -332,7 +364,7 @@ func (r *JobReconciler) ReconcileGenericJob(ctx context.Context, req ctrl.Reques
 }
 
 func isPermanent(e error) bool {
-	return errors.Is(e, ErrInvalidPodsetInfo)
+	return errors.Is(e, ErrInvalidPodsetInfo) || errors.Is(e, ErrInvalidPodSetUpdate)
 }
 
 // IsParentJobManaged checks whether the parent job is managed by kueue.
@@ -399,8 +431,15 @@ func (r *JobReconciler) ensureOneWorkload(ctx context.Context, job GenericJob, o
 			// than one workload...
 			w = &workloads.Items[0]
 		}
-		if err := r.stopJob(ctx, job, object, w, "No matching Workload"); err != nil {
-			return nil, fmt.Errorf("stopping job with no matching workload: %w", err)
+
+		if _, finished := job.Finished(); finished {
+			if err := r.finalizeJob(ctx, job); err != nil {
+				return nil, fmt.Errorf("finalizing job with no matching workload: %w", err)
+			}
+		} else {
+			if err := r.stopJob(ctx, job, object, w, "No matching Workload"); err != nil {
+				return nil, fmt.Errorf("stopping job with no matching workload: %w", err)
+			}
 		}
 	}
 
@@ -476,7 +515,7 @@ func (r *JobReconciler) equivalentToWorkload(job GenericJob, object client.Objec
 
 // startJob will unsuspend the job, and also inject the node affinity.
 func (r *JobReconciler) startJob(ctx context.Context, job GenericJob, object client.Object, wl *kueue.Workload) error {
-	info, err := r.getPodSetsInfoFromAdmission(ctx, wl)
+	info, err := r.getPodSetsInfoFromStatus(ctx, wl)
 	if err != nil {
 		return err
 	}
@@ -500,7 +539,7 @@ func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, object clie
 	info := getPodSetsInfoFromWorkload(wl)
 
 	if jws, implements := job.(JobWithCustomStop); implements {
-		stoppedNow, err := jws.Stop(ctx, r.client, info)
+		stoppedNow, err := jws.Stop(ctx, r.client, info, eventMsg)
 		if stoppedNow {
 			r.record.Eventf(object, corev1.EventTypeNormal, "Stopped", eventMsg)
 		}
@@ -520,6 +559,16 @@ func (r *JobReconciler) stopJob(ctx context.Context, job GenericJob, object clie
 	}
 
 	r.record.Eventf(object, corev1.EventTypeNormal, "Stopped", eventMsg)
+	return nil
+}
+
+func (r *JobReconciler) finalizeJob(ctx context.Context, job GenericJob) error {
+	if jwf, implements := job.(JobWithFinalize); implements {
+		if err := jwf.Finalize(ctx, r.client); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -560,13 +609,14 @@ func (r *JobReconciler) constructWorkload(ctx context.Context, job GenericJob, o
 		)
 	}
 
-	priorityClassName, p, err := r.extractPriority(ctx, podSets, job)
+	priorityClassName, source, p, err := r.extractPriority(ctx, podSets, job)
 	if err != nil {
 		return nil, err
 	}
 
 	wl.Spec.PriorityClassName = priorityClassName
 	wl.Spec.Priority = &p
+	wl.Spec.PriorityClassSource = source
 
 	if err := ctrl.SetControllerReference(object, wl, r.client.Scheme()); err != nil {
 		return nil, err
@@ -574,7 +624,10 @@ func (r *JobReconciler) constructWorkload(ctx context.Context, job GenericJob, o
 	return wl, nil
 }
 
-func (r *JobReconciler) extractPriority(ctx context.Context, podSets []kueue.PodSet, job GenericJob) (string, int32, error) {
+func (r *JobReconciler) extractPriority(ctx context.Context, podSets []kueue.PodSet, job GenericJob) (string, string, int32, error) {
+	if workloadPriorityClass := workloadPriorityClassName(job); len(workloadPriorityClass) > 0 {
+		return utilpriority.GetPriorityFromWorkloadPriorityClass(ctx, r.client, workloadPriorityClass)
+	}
 	if jobWithPriorityClass, isImplemented := job.(JobWithPriorityClass); isImplemented {
 		return utilpriority.GetPriorityFromPriorityClass(
 			ctx, r.client, jobWithPriorityClass.PriorityClass())
@@ -592,46 +645,55 @@ func extractPriorityFromPodSets(podSets []kueue.PodSet) string {
 	return ""
 }
 
-type PodSetInfo struct {
-	Name         string            `json:"name"`
-	NodeSelector map[string]string `json:"nodeSelector"`
-	Count        int32             `json:"count"`
-}
-
-// getPodSetsInfoFromAdmission will extract podSetsInfo and podSets count from admitted workloads.
-func (r *JobReconciler) getPodSetsInfoFromAdmission(ctx context.Context, w *kueue.Workload) ([]PodSetInfo, error) {
+// getPodSetsInfoFromStatus extracts podSetsInfo from workload status, based on
+// admission, and admission checks.
+func (r *JobReconciler) getPodSetsInfoFromStatus(ctx context.Context, w *kueue.Workload) ([]PodSetInfo, error) {
 	if len(w.Status.Admission.PodSetAssignments) == 0 {
 		return nil, nil
 	}
 
-	nodeSelectors := make([]PodSetInfo, len(w.Status.Admission.PodSetAssignments))
+	podSetsInfo := make([]PodSetInfo, len(w.Status.Admission.PodSetAssignments))
 
 	for i, podSetFlavor := range w.Status.Admission.PodSetAssignments {
-		processedFlvs := sets.NewString()
-		nodeSelector := PodSetInfo{
+		processedFlvs := sets.New[kueue.ResourceFlavorReference]()
+		podSetInfo := PodSetInfo{
 			Name:         podSetFlavor.Name,
 			NodeSelector: make(map[string]string),
 			Count:        ptr.Deref(podSetFlavor.Count, w.Spec.PodSets[i].Count),
+			Labels:       make(map[string]string),
+			Annotations:  make(map[string]string),
 		}
 		for _, flvRef := range podSetFlavor.Flavors {
-			flvName := string(flvRef)
-			if processedFlvs.Has(flvName) {
+			if processedFlvs.Has(flvRef) {
 				continue
 			}
 			// Lookup the ResourceFlavors to fetch the node affinity labels to apply on the job.
 			flv := kueue.ResourceFlavor{}
-			if err := r.client.Get(ctx, types.NamespacedName{Name: string(flvName)}, &flv); err != nil {
+			if err := r.client.Get(ctx, types.NamespacedName{Name: string(flvRef)}, &flv); err != nil {
 				return nil, err
 			}
 			for k, v := range flv.Spec.NodeLabels {
-				nodeSelector.NodeSelector[k] = v
+				podSetInfo.NodeSelector[k] = v
 			}
-			processedFlvs.Insert(flvName)
+			processedFlvs.Insert(flvRef)
 		}
-
-		nodeSelectors[i] = nodeSelector
+		for _, admissionCheck := range w.Status.AdmissionChecks {
+			for _, podSetUpdate := range admissionCheck.PodSetUpdates {
+				if podSetUpdate.Name == podSetInfo.Name {
+					if err := podSetInfo.Merge(PodSetInfo{
+						Labels:       podSetUpdate.Labels,
+						Annotations:  podSetUpdate.Annotations,
+						Tolerations:  podSetUpdate.Tolerations,
+						NodeSelector: podSetUpdate.NodeSelector,
+					}); err != nil {
+						return nil, fmt.Errorf("in admission check %q: %w", admissionCheck.Name, err)
+					}
+				}
+			}
+		}
+		podSetsInfo[i] = podSetInfo
 	}
-	return nodeSelectors, nil
+	return podSetsInfo, nil
 }
 
 func (r *JobReconciler) handleJobWithNoWorkload(ctx context.Context, job GenericJob, object client.Object) error {
@@ -683,11 +745,14 @@ func getPodSetsInfoFromWorkload(wl *kueue.Workload) []PodSetInfo {
 		return nil
 	}
 
-	return slices.Map(wl.Spec.PodSets, func(ps *kueue.PodSet) PodSetInfo {
+	return utilslices.Map(wl.Spec.PodSets, func(ps *kueue.PodSet) PodSetInfo {
 		return PodSetInfo{
 			Name:         ps.Name,
-			NodeSelector: maps.Clone(ps.Template.Spec.NodeSelector),
 			Count:        ps.Count,
+			Annotations:  maps.Clone(ps.Template.Annotations),
+			Labels:       maps.Clone(ps.Template.Labels),
+			NodeSelector: maps.Clone(ps.Template.Spec.NodeSelector),
+			Tolerations:  slices.Clone(ps.Template.Spec.Tolerations),
 		}
 	})
 }
@@ -738,4 +803,8 @@ func resetMinCounts(in []kueue.PodSet) []kueue.PodSet {
 
 func BadPodSetsInfoLenError(want, got int) error {
 	return fmt.Errorf("%w: expecting %d podset, got %d", ErrInvalidPodsetInfo, got, want)
+}
+
+func BadPodSetsUpdateError(update string, err error) error {
+	return fmt.Errorf("%w: conflict for %v: %v", ErrInvalidPodSetUpdate, update, err)
 }

@@ -20,7 +20,6 @@ import (
 	"context"
 	"strings"
 
-	"k8s.io/apimachinery/pkg/api/equality"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,7 +31,6 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
-	"sigs.k8s.io/kueue/pkg/util/maps"
 	"sigs.k8s.io/kueue/pkg/util/slices"
 )
 
@@ -60,6 +58,7 @@ func init() {
 //+kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads/finalizers,verbs=update
 //+kubebuilder:rbac:groups=kueue.x-k8s.io,resources=resourceflavors,verbs=get;list;watch
+//+kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloadpriorityclasses,verbs=get;list;watch
 
 var NewReconciler = jobframework.NewGenericReconciler(func() jobframework.GenericJob { return &JobSet{} }, nil)
 
@@ -113,32 +112,33 @@ func (j *JobSet) PodSets() []kueue.PodSet {
 	return podSets
 }
 
-func (j *JobSet) RunWithPodSetsInfo(podSetInfos []jobframework.PodSetInfo) error {
+func (j *JobSet) RunWithPodSetsInfo(podSetsInfo []jobframework.PodSetInfo) error {
 	j.Spec.Suspend = ptr.To(false)
-	if len(podSetInfos) != len(j.Spec.ReplicatedJobs) {
-		return jobframework.BadPodSetsInfoLenError(len(j.Spec.ReplicatedJobs), len(podSetInfos))
+	if len(podSetsInfo) != len(j.Spec.ReplicatedJobs) {
+		return jobframework.BadPodSetsInfoLenError(len(j.Spec.ReplicatedJobs), len(podSetsInfo))
 	}
 
 	// If there are Jobs already created by the JobSet, their node selectors will be updated by the JobSet controller
 	// before unsuspending the individual Jobs.
 	for index := range j.Spec.ReplicatedJobs {
-		templateSpec := &j.Spec.ReplicatedJobs[index].Template.Spec.Template.Spec
-		templateSpec.NodeSelector = maps.MergeKeepFirst(podSetInfos[index].NodeSelector, templateSpec.NodeSelector)
+		template := &j.Spec.ReplicatedJobs[index].Template.Spec.Template
+		info := podSetsInfo[index]
+		if err := jobframework.Merge(&template.ObjectMeta, &template.Spec, info); err != nil {
+			return nil
+		}
 	}
 	return nil
 }
 
-func (j *JobSet) RestorePodSetsInfo(podSetInfos []jobframework.PodSetInfo) bool {
-	if len(podSetInfos) == 0 {
+func (j *JobSet) RestorePodSetsInfo(podSetsInfo []jobframework.PodSetInfo) bool {
+	if len(podSetsInfo) == 0 {
 		return false
 	}
 	changed := false
 	for index := range j.Spec.ReplicatedJobs {
-		if equality.Semantic.DeepEqual(j.Spec.ReplicatedJobs[index].Template.Spec.Template.Spec.NodeSelector, podSetInfos[index].NodeSelector) {
-			continue
-		}
-		changed = true
-		j.Spec.ReplicatedJobs[index].Template.Spec.Template.Spec.NodeSelector = maps.Clone(podSetInfos[index].NodeSelector)
+		replica := &j.Spec.ReplicatedJobs[index].Template.Spec.Template
+		info := podSetsInfo[index]
+		changed = jobframework.Restore(&replica.ObjectMeta, &replica.Spec, info) || changed
 	}
 	return changed
 }

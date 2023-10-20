@@ -30,9 +30,24 @@ const (
 	// owner: @trasc
 	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/420-partial-admission
 	// alpha: v0.4
+	// beta: v0.5
 	//
 	// Enables partial admission.
 	PartialAdmission featuregate.Feature = "PartialAdmission"
+
+	// owner: @stuton
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/168-pending-workloads-visibility
+	// alpha: v0.5
+	//
+	// Enables queue visibility.
+	QueueVisibility featuregate.Feature = "QueueVisibility"
+
+	// owner: @KunWuLuan
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/582-preempt-based-on-flavor-order
+	// beta: v0.5
+	//
+	// Enables flavor fungibility.
+	FlavorFungibility featuregate.Feature = "FlavorFungibility"
 )
 
 func init() {
@@ -46,7 +61,9 @@ func init() {
 // Entries are separated from each other with blank lines to avoid sweeping gofmt changes
 // when adding or removing one entry.
 var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	PartialAdmission: {Default: false, PreRelease: featuregate.Alpha},
+	PartialAdmission:  {Default: true, PreRelease: featuregate.Beta},
+	QueueVisibility:   {Default: false, PreRelease: featuregate.Alpha},
+	FlavorFungibility: {Default: true, PreRelease: featuregate.Beta},
 }
 
 func SetFeatureGateDuringTest(tb testing.TB, f featuregate.Feature, value bool) func() {

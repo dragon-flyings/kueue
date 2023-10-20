@@ -151,6 +151,11 @@ func (w *WorkloadWrapper) Priority(priority int32) *WorkloadWrapper {
 	return w
 }
 
+func (w *WorkloadWrapper) PriorityClassSource(source string) *WorkloadWrapper {
+	w.Spec.PriorityClassSource = source
+	return w
+}
+
 func (w *WorkloadWrapper) PodSets(podSets ...kueue.PodSet) *WorkloadWrapper {
 	w.Spec.PodSets = podSets
 	return w
@@ -168,6 +173,11 @@ func (w *WorkloadWrapper) NodeSelector(kv map[string]string) *WorkloadWrapper {
 
 func (w *WorkloadWrapper) Condition(condition metav1.Condition) *WorkloadWrapper {
 	apimeta.SetStatusCondition(&w.Status.Conditions, condition)
+	return w
+}
+
+func (w *WorkloadWrapper) AdmissionCheck(ac kueue.AdmissionCheckState) *WorkloadWrapper {
+	w.Status.AdmissionChecks = append(w.Status.AdmissionChecks, ac)
 	return w
 }
 
@@ -214,6 +224,11 @@ func MakePodSet(name string, count int) *PodSetWrapper {
 	}
 }
 
+func (p *PodSetWrapper) PriorityClass(pc string) *PodSetWrapper {
+	p.Template.Spec.PriorityClassName = pc
+	return p
+}
+
 func (p *PodSetWrapper) Obj() *kueue.PodSet {
 	return &p.PodSet
 }
@@ -245,6 +260,11 @@ func (p *PodSetWrapper) InitContainers(containers ...corev1.Container) *PodSetWr
 
 func (p *PodSetWrapper) NodeSelector(kv map[string]string) *PodSetWrapper {
 	p.Template.Spec.NodeSelector = kv
+	return p
+}
+
+func (p *PodSetWrapper) SchedulingGates(sg ...corev1.PodSchedulingGate) *PodSetWrapper {
+	p.Template.Spec.SchedulingGates = sg
 	return p
 }
 
@@ -344,6 +364,10 @@ func MakeClusterQueue(name string) *ClusterQueueWrapper {
 		Spec: kueue.ClusterQueueSpec{
 			NamespaceSelector: &metav1.LabelSelector{},
 			QueueingStrategy:  kueue.BestEffortFIFO,
+			FlavorFungibility: &kueue.FlavorFungibility{
+				WhenCanBorrow:  kueue.Borrow,
+				WhenCanPreempt: kueue.TryNextFlavor,
+			},
 		},
 	}}
 }
@@ -406,6 +430,12 @@ func (c *ClusterQueueWrapper) NamespaceSelector(s *metav1.LabelSelector) *Cluste
 // Preemption sets the preeemption policies.
 func (c *ClusterQueueWrapper) Preemption(p kueue.ClusterQueuePreemption) *ClusterQueueWrapper {
 	c.Spec.Preemption = &p
+	return c
+}
+
+// Preemption sets the preeemption policies.
+func (c *ClusterQueueWrapper) FlavorFungibility(p kueue.FlavorFungibility) *ClusterQueueWrapper {
+	c.Spec.FlavorFungibility = &p
 	return c
 }
 
@@ -563,6 +593,41 @@ func MakeAdmissionCheck(name string) *AdmissionCheckWrapper {
 	}
 }
 
+func (ac *AdmissionCheckWrapper) Active(status metav1.ConditionStatus) *AdmissionCheckWrapper {
+	apimeta.SetStatusCondition(&ac.Status.Conditions, metav1.Condition{
+		Type:    kueue.AdmissionCheckActive,
+		Status:  status,
+		Reason:  "ByTest",
+		Message: "by test",
+	})
+	return ac
+}
+
 func (ac *AdmissionCheckWrapper) Obj() *kueue.AdmissionCheck {
 	return &ac.AdmissionCheck
+}
+
+// WorkloadPriorityClassWrapper wraps a WorkloadPriorityClass.
+type WorkloadPriorityClassWrapper struct {
+	kueue.WorkloadPriorityClass
+}
+
+// MakeWorkloadPriorityClass creates a wrapper for a WorkloadPriorityClass.
+func MakeWorkloadPriorityClass(name string) *WorkloadPriorityClassWrapper {
+	return &WorkloadPriorityClassWrapper{kueue.WorkloadPriorityClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		}},
+	}
+}
+
+// PriorityValue updates value of WorkloadPriorityClass.
+func (p *WorkloadPriorityClassWrapper) PriorityValue(v int32) *WorkloadPriorityClassWrapper {
+	p.Value = v
+	return p
+}
+
+// Obj returns the inner WorkloadPriorityClass.
+func (p *WorkloadPriorityClassWrapper) Obj() *kueue.WorkloadPriorityClass {
+	return &p.WorkloadPriorityClass
 }
