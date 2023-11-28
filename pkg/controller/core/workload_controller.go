@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -159,6 +160,11 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if evictionTriggered, err := r.reconcileCheckBasedEviction(ctx, &wl); evictionTriggered || err != nil {
 			return ctrl.Result{}, err
 		}
+
+		if reservationRemoved, err := r.reconcileReservationOnClusterQueueDeletion(ctx, &wl, cqName); reservationRemoved || err != nil {
+			return ctrl.Result{}, err
+		}
+
 		return r.reconcileNotReadyTimeout(ctx, req, &wl)
 	}
 
@@ -212,6 +218,26 @@ func (r *WorkloadReconciler) reconcileSyncAdmissionChecks(ctx context.Context, w
 		wl.Status.AdmissionChecks = newChecks
 		err := r.client.Status().Update(ctx, wl)
 		return true, client.IgnoreNotFound(err)
+	}
+	return false, nil
+}
+
+func (r *WorkloadReconciler) reconcileReservationOnClusterQueueDeletion(ctx context.Context, wl *kueue.Workload, cqName string) (bool, error) {
+	if workload.IsAdmitted(wl) {
+		return false, nil
+	}
+
+	queue := kueue.ClusterQueue{}
+	err := r.client.Get(ctx, types.NamespacedName{Name: cqName}, &queue)
+	if client.IgnoreNotFound(err) != nil {
+		return false, err
+	}
+
+	if apierrors.IsNotFound(err) || !queue.DeletionTimestamp.IsZero() {
+		log := ctrl.LoggerFrom(ctx)
+		log.V(3).Info("Workload is inadmissible because ClusterQueue is terminating or missing", "clusterQueue", klog.KRef("", cqName))
+		workload.UnsetQuotaReservationWithCondition(wl, "Inadmissible", fmt.Sprintf("ClusterQueue %s is terminating or missing", cqName))
+		return true, workload.ApplyAdmissionStatus(ctx, r.client, wl, true)
 	}
 	return false, nil
 }
@@ -314,7 +340,7 @@ func (r *WorkloadReconciler) Delete(e event.DeleteEvent) bool {
 	ctx := ctrl.LoggerInto(context.Background(), log)
 
 	// When assigning a clusterQueue to a workload, we assume it in the cache. If
-	// the state is unknown, the workload could have been assumed and we need
+	// the state is unknown, the workload could have been assumed, and we need
 	// to clear it from the cache.
 	if workload.HasQuotaReservation(wl) || e.DeleteStateUnknown {
 		// trigger the move of associated inadmissibleWorkloads if required.
@@ -446,7 +472,7 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// admittedNotReadyWorkload returns as pair of values. The first boolean determines
+// admittedNotReadyWorkload returns as a pair of values. The first boolean determines
 // if the workload is currently counting towards the timeout for PodsReady, i.e.
 // it has the Admitted condition True and the PodsReady condition not equal
 // True (False or not set). The second value is the remaining time to exceed the
@@ -557,7 +583,7 @@ type workloadCqHandler struct {
 
 var _ handler.EventHandler = (*workloadCqHandler)(nil)
 
-// Create is called in response to an create event.
+// Create is called in response to a create event.
 func (w *workloadCqHandler) Create(ctx context.Context, ev event.CreateEvent, wq workqueue.RateLimitingInterface) {
 	if cq, isQueue := ev.Object.(*kueue.ClusterQueue); isQueue {
 		w.queueReconcileForWorkloads(ctx, cq.Name, wq)
@@ -571,7 +597,12 @@ func (w *workloadCqHandler) Update(ctx context.Context, ev event.UpdateEvent, wq
 	log.V(5).Info("Workload cluster queue update event")
 	oldCq, oldIsQueue := ev.ObjectOld.(*kueue.ClusterQueue)
 	newCq, newIsQueue := ev.ObjectNew.(*kueue.ClusterQueue)
-	if oldIsQueue && newIsQueue && !slices.CmpNoOrder(oldCq.Spec.AdmissionChecks, newCq.Spec.AdmissionChecks) {
+
+	if !oldIsQueue || !newIsQueue {
+		return
+	}
+
+	if !newCq.DeletionTimestamp.IsZero() || !slices.CmpNoOrder(oldCq.Spec.AdmissionChecks, newCq.Spec.AdmissionChecks) {
 		w.queueReconcileForWorkloads(ctx, newCq.Name, wq)
 	}
 }

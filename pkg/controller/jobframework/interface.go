@@ -18,10 +18,13 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
 	"sigs.k8s.io/kueue/pkg/controller/constants"
+	"sigs.k8s.io/kueue/pkg/podset"
 )
 
 // GenericJob if the interface which needs to be implemented by all jobs
@@ -34,10 +37,10 @@ type GenericJob interface {
 	// Suspend will suspend the job.
 	Suspend()
 	// RunWithPodSetsInfo will inject the node affinity and podSet counts extracting from workload to job and unsuspend it.
-	RunWithPodSetsInfo(podSetsInfo []PodSetInfo) error
+	RunWithPodSetsInfo(podSetsInfo []podset.PodSetInfo) error
 	// RestorePodSetsInfo will restore the original node affinity and podSet counts of the job.
 	// Returns whether any change was done.
-	RestorePodSetsInfo(podSetsInfo []PodSetInfo) bool
+	RestorePodSetsInfo(podSetsInfo []podset.PodSetInfo) bool
 	// Finished means whether the job is completed/failed or not,
 	// condition represents the workload finished condition.
 	Finished() (condition metav1.Condition, finished bool)
@@ -63,7 +66,7 @@ type JobWithCustomStop interface {
 	// Stop implements a custom stop procedure.
 	// The function should be idempotent: not do any API calls if the job is already stopped.
 	// Returns whether the Job stopped with this call or an error
-	Stop(ctx context.Context, c client.Client, podSetsInfo []PodSetInfo, eventMsg string) (bool, error)
+	Stop(ctx context.Context, c client.Client, podSetsInfo []podset.PodSetInfo, eventMsg string) (bool, error)
 }
 
 // JobWithFinalize interface should be implemented by generic jobs,
@@ -81,6 +84,17 @@ type JobWithSkip interface {
 type JobWithPriorityClass interface {
 	// PriorityClass returns the job's priority class name.
 	PriorityClass() string
+}
+
+// ComposableJob interface should be implemented by generic jobs that
+// are composed out of multiple API objects.
+type ComposableJob interface {
+	// Load loads all members of the composable job. If removeFinalizers == true, workload and job finalizers should be removed.
+	Load(ctx context.Context, c client.Client, key types.NamespacedName) (removeFinalizers bool, err error)
+	// ConstructComposableWorkload returns a new Workload that's assembled out of all members of the ComposableJob.
+	ConstructComposableWorkload(ctx context.Context, c client.Client, r record.EventRecorder) (*kueue.Workload, error)
+	// FindMatchingWorkloads returns all related workloads, workload that matches the ComposableJob and duplicates that has to be deleted.
+	FindMatchingWorkloads(ctx context.Context, c client.Client) (match *kueue.Workload, toDelete []*kueue.Workload, err error)
 }
 
 func ParentWorkloadName(job GenericJob) string {

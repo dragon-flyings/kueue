@@ -256,7 +256,7 @@ func TestUpdateWorkloadStatus(t *testing.T) {
 			workload.Status = tc.oldStatus
 			cl := utiltesting.NewFakeClient(workload)
 			ctx := context.Background()
-			err := UpdateStatus(ctx, cl, workload, tc.condType, tc.condStatus, tc.reason, tc.message, "manager-perfix")
+			err := UpdateStatus(ctx, cl, workload, tc.condType, tc.condStatus, tc.reason, tc.message, "manager-prefix")
 			if err != nil {
 				t.Fatalf("Failed updating status: %v", err)
 			}
@@ -370,6 +370,67 @@ func TestReclaimablePodsAreEqual(t *testing.T) {
 			result := ReclaimablePodsAreEqual(tc.a, tc.b)
 			if diff := cmp.Diff(result, tc.wantResult); diff != "" {
 				t.Errorf("Unexpected time (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAssignmentClusterQueueState(t *testing.T) {
+	cases := map[string]struct {
+		state              *AssigmentClusterQueueState
+		wantPendingFlavors bool
+	}{
+		"no info": {
+			wantPendingFlavors: false,
+		},
+		"all done": {
+			state: &AssigmentClusterQueueState{
+				LastTriedFlavorIdx: []map[corev1.ResourceName]int{
+					{
+						corev1.ResourceCPU:    -1,
+						corev1.ResourceMemory: -1,
+					},
+					{
+						corev1.ResourceMemory: -1,
+					},
+				},
+			},
+			wantPendingFlavors: false,
+		},
+		"some pending": {
+			state: &AssigmentClusterQueueState{
+				LastTriedFlavorIdx: []map[corev1.ResourceName]int{
+					{
+						corev1.ResourceCPU:    0,
+						corev1.ResourceMemory: -1,
+					},
+					{
+						corev1.ResourceMemory: 1,
+					},
+				},
+			},
+			wantPendingFlavors: true,
+		},
+		"all pending": {
+			state: &AssigmentClusterQueueState{
+				LastTriedFlavorIdx: []map[corev1.ResourceName]int{
+					{
+						corev1.ResourceCPU:    1,
+						corev1.ResourceMemory: 0,
+					},
+					{
+						corev1.ResourceMemory: 1,
+					},
+				},
+			},
+			wantPendingFlavors: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := tc.state.PendingFlavors()
+			if got != tc.wantPendingFlavors {
+				t.Errorf("state.PendingFlavors() = %t, want %t", got, tc.wantPendingFlavors)
 			}
 		})
 	}

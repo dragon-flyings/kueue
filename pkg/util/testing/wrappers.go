@@ -102,6 +102,7 @@ func (w *WorkloadWrapper) Queue(q string) *WorkloadWrapper {
 	return w
 }
 
+// ReserveQuota sets workload admission and adds a "QuotaReserved" status condition
 func (w *WorkloadWrapper) ReserveQuota(a *kueue.Admission) *WorkloadWrapper {
 	w.Status.Admission = a
 	w.Status.Conditions = []metav1.Condition{{
@@ -200,6 +201,11 @@ func (w *WorkloadWrapper) Labels(l map[string]string) *WorkloadWrapper {
 	return w
 }
 
+func (w *WorkloadWrapper) AdmissionChecks(checks ...kueue.AdmissionCheckState) *WorkloadWrapper {
+	w.Status.AdmissionChecks = checks
+	return w
+}
+
 type PodSetWrapper struct{ kueue.PodSet }
 
 func MakePodSet(name string, count int) *PodSetWrapper {
@@ -229,12 +235,30 @@ func (p *PodSetWrapper) PriorityClass(pc string) *PodSetWrapper {
 	return p
 }
 
+func (p *PodSetWrapper) RuntimeClass(name string) *PodSetWrapper {
+	p.Template.Spec.RuntimeClassName = &name
+	return p
+}
+
 func (p *PodSetWrapper) Obj() *kueue.PodSet {
 	return &p.PodSet
 }
 
 func (p *PodSetWrapper) Request(r corev1.ResourceName, q string) *PodSetWrapper {
 	p.Template.Spec.Containers[0].Resources.Requests[r] = resource.MustParse(q)
+	return p
+}
+
+func (p *PodSetWrapper) Limit(r corev1.ResourceName, q string) *PodSetWrapper {
+	if p.Template.Spec.Containers[0].Resources.Limits == nil {
+		p.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{}
+	}
+	p.Template.Spec.Containers[0].Resources.Limits[r] = resource.MustParse(q)
+	return p
+}
+
+func (p *PodSetWrapper) Image(image string) *PodSetWrapper {
+	p.Template.Spec.Containers[0].Image = image
 	return p
 }
 
@@ -263,8 +287,23 @@ func (p *PodSetWrapper) NodeSelector(kv map[string]string) *PodSetWrapper {
 	return p
 }
 
+func (p *PodSetWrapper) Labels(kv map[string]string) *PodSetWrapper {
+	p.Template.Labels = kv
+	return p
+}
+
+func (p *PodSetWrapper) Annotations(kv map[string]string) *PodSetWrapper {
+	p.Template.Annotations = kv
+	return p
+}
+
 func (p *PodSetWrapper) SchedulingGates(sg ...corev1.PodSchedulingGate) *PodSetWrapper {
 	p.Template.Spec.SchedulingGates = sg
+	return p
+}
+
+func (p *PodSetWrapper) PodOverHead(resources corev1.ResourceList) *PodSetWrapper {
+	p.Template.Spec.Overhead = resources
 	return p
 }
 
@@ -503,6 +542,12 @@ func (rf *ResourceFlavorWrapper) Taint(t corev1.Taint) *ResourceFlavorWrapper {
 	return rf
 }
 
+// Toleration  adds a taint to the ResourceFlavor.
+func (rf *ResourceFlavorWrapper) Toleration(t corev1.Toleration) *ResourceFlavorWrapper {
+	rf.Spec.Tolerations = append(rf.Spec.Tolerations, t)
+	return rf
+}
+
 // RuntimeClassWrapper wraps a RuntimeClass.
 type RuntimeClassWrapper struct{ nodev1.RuntimeClass }
 
@@ -516,7 +561,7 @@ func MakeRuntimeClass(name, handler string) *RuntimeClassWrapper {
 	}}
 }
 
-// PodOverhead adds a Overhead to the RuntimeClass.
+// PodOverhead adds an Overhead to the RuntimeClass.
 func (rc *RuntimeClassWrapper) PodOverhead(resources corev1.ResourceList) *RuntimeClassWrapper {
 	rc.Overhead = &nodev1.Overhead{
 		PodFixed: resources,
@@ -600,6 +645,20 @@ func (ac *AdmissionCheckWrapper) Active(status metav1.ConditionStatus) *Admissio
 		Reason:  "ByTest",
 		Message: "by test",
 	})
+	return ac
+}
+
+func (ac *AdmissionCheckWrapper) ControllerName(c string) *AdmissionCheckWrapper {
+	ac.Spec.ControllerName = c
+	return ac
+}
+
+func (ac *AdmissionCheckWrapper) Parameters(apigroup, kind, name string) *AdmissionCheckWrapper {
+	ac.Spec.Parameters = &kueue.AdmissionCheckParametersReference{
+		APIGroup: apigroup,
+		Kind:     kind,
+		Name:     name,
+	}
 	return ac
 }
 

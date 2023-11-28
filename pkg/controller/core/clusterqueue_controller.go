@@ -78,7 +78,7 @@ type ClusterQueueReconcilerOptions struct {
 	QueueVisibilityClusterQueuesMaxCount int32
 }
 
-// Option configures the reconciler.
+// ClusterQueueReconcilerOption configures the reconciler.
 type ClusterQueueReconcilerOption func(*ClusterQueueReconcilerOptions)
 
 func WithWatchers(watchers ...ClusterQueueUpdateWatcher) ClusterQueueReconcilerOption {
@@ -170,7 +170,7 @@ func (r *ClusterQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 		if controllerutil.ContainsFinalizer(&cqObj, kueue.ResourceInUseFinalizerName) {
 			// The clusterQueue is being deleted, remove the finalizer only if
-			// there are no active admitted workloads.
+			// there are no active reserving workloads.
 			if r.cache.ClusterQueueEmpty(cqObj.Name) {
 				controllerutil.RemoveFinalizer(&cqObj, kueue.ResourceInUseFinalizerName)
 				if err := r.client.Update(ctx, &cqObj); err != nil {
@@ -208,7 +208,7 @@ func (r *ClusterQueueReconciler) notifyWatchers(oldCQ, newCQ *kueue.ClusterQueue
 	}
 }
 
-// Updates are ignored since they have no impact on the ClusterQueue's readiness.
+// NotifyResourceFlavorUpdate ignores updates since they have no impact on the ClusterQueue's readiness.
 func (r *ClusterQueueReconciler) NotifyResourceFlavorUpdate(oldRF, newRF *kueue.ResourceFlavor) {
 	// if oldRF is nil, it's a create event.
 	if oldRF == nil {
@@ -332,6 +332,14 @@ func recordResourceMetrics(cq *kueue.ClusterQueue) {
 		}
 	}
 
+	for fri := range cq.Status.FlavorsReservation {
+		fr := &cq.Status.FlavorsReservation[fri]
+		for ri := range fr.Resources {
+			r := &fr.Resources[ri]
+			metrics.ReportClusterQueueResourceReservations(cq.Spec.Cohort, cq.Name, string(fr.Name), string(r.Name), resource.QuantityToFloat(&r.Total))
+		}
+	}
+
 	for fui := range cq.Status.FlavorsUsage {
 		fu := &cq.Status.FlavorsUsage[fui]
 		for ri := range fu.Resources {
@@ -371,6 +379,28 @@ func clearOldResourceQuotas(oldCq, newCq *kueue.ClusterQueue) {
 					rname := flavor.Resources[ri].Name
 					if _, found := newResources[rname]; !found {
 						metrics.ClearClusterQueueResourceQuotas(oldCq.Name, string(flavor.Name), string(rname))
+					}
+				}
+			}
+		}
+	}
+
+	// reservation metrics
+	if len(oldCq.Status.FlavorsReservation) > 0 {
+		newFlavors := map[kueue.ResourceFlavorReference]*kueue.FlavorUsage{}
+		if len(newCq.Status.FlavorsReservation) > 0 {
+			newFlavors = slices.ToRefMap(newCq.Status.FlavorsReservation, func(f *kueue.FlavorUsage) kueue.ResourceFlavorReference { return f.Name })
+		}
+		for fi := range oldCq.Status.FlavorsReservation {
+			flavor := &oldCq.Status.FlavorsReservation[fi]
+			if newFlavor, found := newFlavors[flavor.Name]; !found || len(newFlavor.Resources) == 0 {
+				metrics.ClearClusterQueueResourceReservations(oldCq.Name, string(flavor.Name), "")
+			} else {
+				newResources := slices.ToRefMap(newFlavor.Resources, func(r *kueue.ResourceUsage) corev1.ResourceName { return r.Name })
+				for ri := range flavor.Resources {
+					rname := flavor.Resources[ri].Name
+					if _, found := newResources[rname]; !found {
+						metrics.ClearClusterQueueResourceReservations(oldCq.Name, string(flavor.Name), string(rname))
 					}
 				}
 			}
@@ -600,15 +630,17 @@ func (r *ClusterQueueReconciler) updateCqStatusIfChanged(
 ) error {
 	oldStatus := cq.Status.DeepCopy()
 	pendingWorkloads := r.qManager.Pending(cq)
-	usage, workloads, err := r.cache.Usage(cq)
+	stats, err := r.cache.Usage(cq)
 	if err != nil {
 		r.log.Error(err, "Failed getting usage from cache")
 		// This is likely because the cluster queue was recently removed,
 		// but we didn't process that event yet.
 		return err
 	}
-	cq.Status.FlavorsUsage = usage
-	cq.Status.AdmittedWorkloads = int32(workloads)
+	cq.Status.FlavorsReservation = stats.ReservedResources
+	cq.Status.FlavorsUsage = stats.AdmittedResources
+	cq.Status.ReservingWorkloads = int32(stats.ReservingWorkloads)
+	cq.Status.AdmittedWorkloads = int32(stats.AdmittedWorkloads)
 	cq.Status.PendingWorkloads = int32(pendingWorkloads)
 	cq.Status.PendingWorkloadsStatus = r.getWorkloadsStatus(cq)
 	meta.SetStatusCondition(&cq.Status.Conditions, metav1.Condition{

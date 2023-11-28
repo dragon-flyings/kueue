@@ -120,12 +120,13 @@ var _ = ginkgo.Describe("Job controller", ginkgo.Ordered, ginkgo.ContinueOnFailu
 
 		ginkgo.By("checking the workload is created without queue assigned")
 		createdWorkload := &kueue.Workload{}
-		gomega.Eventually(func() bool {
-			err := k8sClient.Get(ctx, wlLookupKey, createdWorkload)
-			return err == nil
-		}, util.Timeout, util.Interval).Should(gomega.BeTrue())
+		gomega.Eventually(func() error {
+			return k8sClient.Get(ctx, wlLookupKey, createdWorkload)
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
 		gomega.Expect(createdWorkload.Spec.QueueName).Should(gomega.Equal(""), "The Workload shouldn't have .spec.queueName set")
 		gomega.Expect(metav1.IsControlledBy(createdWorkload, job)).To(gomega.BeTrue(), "The Workload should be owned by the Job")
+
+		createdTime := createdWorkload.CreationTimestamp
 
 		ginkgo.By("checking the workload is created with priority and priorityName")
 		gomega.Expect(createdWorkload.Spec.PriorityClassName).Should(gomega.Equal(priorityClassName))
@@ -141,6 +142,10 @@ var _ = ginkgo.Describe("Job controller", ginkgo.Ordered, ginkgo.ContinueOnFailu
 			}
 			return createdWorkload.Spec.QueueName == jobQueueName
 		}, util.Timeout, util.Interval).Should(gomega.BeTrue())
+
+		ginkgo.By("updated workload should have the same created timestamp", func() {
+			gomega.Expect(createdWorkload.CreationTimestamp).Should(gomega.Equal(createdTime))
+		})
 
 		ginkgo.By("checking a second non-matching workload is deleted")
 		secondWl := &kueue.Workload{
@@ -159,10 +164,9 @@ var _ = ginkgo.Describe("Job controller", ginkgo.Ordered, ginkgo.ContinueOnFailu
 			return k8sClient.Get(ctx, key, wl)
 		}, util.Timeout, util.Interval).Should(testing.BeNotFoundError())
 		// check the original wl is still there
-		gomega.Consistently(func() bool {
-			err := k8sClient.Get(ctx, wlLookupKey, createdWorkload)
-			return err == nil
-		}, util.ConsistentDuration, util.Interval).Should(gomega.BeTrue())
+		gomega.Consistently(func() error {
+			return k8sClient.Get(ctx, wlLookupKey, createdWorkload)
+		}, util.ConsistentDuration, util.Interval).Should(gomega.Succeed())
 		gomega.Eventually(func() bool {
 			ok, _ := testing.CheckLatestEvent(ctx, k8sClient, "DeletedWorkload", corev1.EventTypeNormal, fmt.Sprintf("Deleted not matching Workload: %v", workload.Key(secondWl)))
 			return ok
@@ -449,7 +453,7 @@ var _ = ginkgo.Describe("Job controller", ginkgo.Ordered, ginkgo.ContinueOnFailu
 		)
 
 		ginkgo.BeforeEach(func() {
-			admissionCheck = testing.MakeAdmissionCheck("check").Obj()
+			admissionCheck = testing.MakeAdmissionCheck("check").ControllerName("ac-controller").Obj()
 			gomega.Expect(k8sClient.Create(ctx, admissionCheck)).To(gomega.Succeed())
 			util.SetAdmissionCheckActive(ctx, k8sClient, admissionCheck, metav1.ConditionTrue)
 			clusterQueueAc = testing.MakeClusterQueue("prod-cq-with-checks").
@@ -588,12 +592,17 @@ var _ = ginkgo.Describe("Job controller", ginkgo.Ordered, ginkgo.ContinueOnFailu
 			})
 
 			ginkgo.By("verify the PodSetUpdates are restored", func() {
-				gomega.Expect(createdJob.Spec.Template.Annotations).ShouldNot(gomega.HaveKey("ann1"))
-				gomega.Expect(createdJob.Spec.Template.Annotations).Should(gomega.HaveKeyWithValue("old-ann-key", "old-ann-value"))
-				gomega.Expect(createdJob.Spec.Template.Labels).ShouldNot(gomega.HaveKey("label1"))
-				gomega.Expect(createdJob.Spec.Template.Labels).Should(gomega.HaveKeyWithValue("old-label-key", "old-label-value"))
-				gomega.Expect(createdJob.Spec.Template.Spec.NodeSelector).ShouldNot(gomega.HaveKey(instanceKey))
-				gomega.Expect(createdJob.Spec.Template.Spec.NodeSelector).ShouldNot(gomega.HaveKey("selector1"))
+				// In case of batch/Job the stop is done with multiple API calls, suspended=true being
+				// done before the info restoration. We should retry the read if the Info is not restored.
+				gomega.Eventually(func(g gomega.Gomega) {
+					g.Expect(k8sClient.Get(ctx, *jobLookupKey, createdJob)).Should(gomega.Succeed())
+					g.Expect(createdJob.Spec.Template.Annotations).ShouldNot(gomega.HaveKey("ann1"))
+					g.Expect(createdJob.Spec.Template.Annotations).Should(gomega.HaveKeyWithValue("old-ann-key", "old-ann-value"))
+					g.Expect(createdJob.Spec.Template.Labels).ShouldNot(gomega.HaveKey("label1"))
+					g.Expect(createdJob.Spec.Template.Labels).Should(gomega.HaveKeyWithValue("old-label-key", "old-label-value"))
+					g.Expect(createdJob.Spec.Template.Spec.NodeSelector).ShouldNot(gomega.HaveKey(instanceKey))
+					g.Expect(createdJob.Spec.Template.Spec.NodeSelector).ShouldNot(gomega.HaveKey("selector1"))
+				}, util.Timeout, util.Interval).Should(gomega.Succeed())
 			})
 		})
 
@@ -1032,7 +1041,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 		}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(false)))
 		gomega.Expect(createdProdJob1.Spec.Template.Spec.NodeSelector[instanceKey]).Should(gomega.Equal(onDemandFlavor.Name))
 		util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 0)
-		util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 1)
+		util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 1)
 
 		ginkgo.By("checking a second no-fit prod job does not start")
 		prodJob2 := testingjob.MakeJob("prod-job2", ns.Name).Queue(prodLocalQ.Name).Request(corev1.ResourceCPU, "5").Obj()
@@ -1044,7 +1053,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 			return createdProdJob2.Spec.Suspend
 		}, util.ConsistentDuration, util.Interval).Should(gomega.Equal(ptr.To(true)))
 		util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 1)
-		util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 1)
+		util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 1)
 
 		ginkgo.By("checking a dev job starts")
 		devJob := testingjob.MakeJob("dev-job", ns.Name).Queue(devLocalQ.Name).Request(corev1.ResourceCPU, "5").Obj()
@@ -1057,7 +1066,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 		}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(false)))
 		gomega.Expect(createdDevJob.Spec.Template.Spec.NodeSelector[instanceKey]).Should(gomega.Equal(spotUntaintedFlavor.Name))
 		util.ExpectPendingWorkloadsMetric(devClusterQ, 0, 0)
-		util.ExpectAdmittedActiveWorkloadsMetric(devClusterQ, 1)
+		util.ExpectReservingActiveWorkloadsMetric(devClusterQ, 1)
 
 		ginkgo.By("checking the second prod job starts when the first finishes")
 		createdProdJob1.Status.Conditions = append(createdProdJob1.Status.Conditions,
@@ -1074,7 +1083,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 		}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(false)))
 		gomega.Expect(createdProdJob2.Spec.Template.Spec.NodeSelector[instanceKey]).Should(gomega.Equal(onDemandFlavor.Name))
 		util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 0)
-		util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 1)
+		util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 1)
 	})
 
 	ginkgo.It("Should unsuspend job iff localQueue is in the same namespace", func() {
@@ -1320,7 +1329,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 			}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(false)))
 			gomega.Expect(createdJob1.Spec.Template.Spec.NodeSelector[instanceKey]).Should(gomega.Equal(onDemandFlavor.Name))
 			util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 0)
-			util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 1)
+			util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 1)
 		})
 
 		job2 := testingjob.MakeJob("job2", ns.Name).Queue(prodLocalQ.Name).Request(corev1.ResourceCPU, "3").Obj()
@@ -1334,7 +1343,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 				return createdJob2.Spec.Suspend
 			}, util.ConsistentDuration, util.Interval).Should(gomega.Equal(ptr.To(true)))
 			util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 1)
-			util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 1)
+			util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 1)
 		})
 
 		ginkgo.By("checking the second job starts when the first has less then to completions to go", func() {
@@ -1362,7 +1371,7 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 			gomega.Expect(createdJob2.Spec.Template.Spec.NodeSelector[instanceKey]).Should(gomega.Equal(onDemandFlavor.Name))
 
 			util.ExpectPendingWorkloadsMetric(prodClusterQ, 0, 0)
-			util.ExpectAdmittedActiveWorkloadsMetric(prodClusterQ, 2)
+			util.ExpectReservingActiveWorkloadsMetric(prodClusterQ, 2)
 		})
 	})
 
@@ -1541,6 +1550,50 @@ var _ = ginkgo.Describe("Job controller interacting with scheduler", ginkgo.Orde
 			expectJobUnsuspendedWithNodeSelectors(client.ObjectKeyFromObject(job), map[string]string{
 				instanceKey: "on-demand",
 			})
+		})
+	})
+	ginkgo.It("Should schedule updated job and update the workload", func() {
+		localQueue := testing.MakeLocalQueue("local-queue", ns.Name).ClusterQueue(prodClusterQ.Name).Obj()
+		ginkgo.By("create a localQueue", func() {
+			gomega.Expect(k8sClient.Create(ctx, localQueue)).Should(gomega.Succeed())
+		})
+
+		job := testingjob.MakeJob(jobName, ns.Name).Queue(localQueue.Name).Request(corev1.ResourceCPU, "3").Parallelism(2).Suspend(false).Obj()
+		lookupKey := types.NamespacedName{Name: job.Name, Namespace: job.Namespace}
+		createdJob := &batchv1.Job{}
+
+		ginkgo.By("creating the job that doesn't fit", func() {
+			gomega.Expect(k8sClient.Create(ctx, job)).Should(gomega.Succeed())
+		})
+
+		ginkgo.By("job should be suspend", func() {
+			gomega.Eventually(func() *bool {
+				gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+				return createdJob.Spec.Suspend
+			}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(true)))
+		})
+
+		wlLookupKey := types.NamespacedName{Name: workloadjob.GetWorkloadNameForJob(jobName), Namespace: ns.Name}
+		createdWorkload := util.AwaitAndVerifyCreatedWorkload(ctx, k8sClient, wlLookupKey, createdJob)
+		createdTime := createdWorkload.CreationTimestamp
+
+		createdJob.Spec.Parallelism = ptr.To[int32](1)
+
+		ginkgo.By("updating the job", func() {
+			gomega.Expect(k8sClient.Update(ctx, createdJob)).Should(gomega.Succeed())
+		})
+
+		createdWorkload = util.AwaitAndVerifyCreatedWorkload(ctx, k8sClient, wlLookupKey, createdJob)
+
+		ginkgo.By("updated job should be unsuspended", func() {
+			gomega.Eventually(func() *bool {
+				gomega.Expect(k8sClient.Get(ctx, lookupKey, createdJob)).Should(gomega.Succeed())
+				return createdJob.Spec.Suspend
+			}, util.Timeout, util.Interval).Should(gomega.Equal(ptr.To(false)))
+		})
+
+		ginkgo.By("updated workload should have the same created timestamp", func() {
+			gomega.Expect(createdWorkload.CreationTimestamp).Should(gomega.Equal(createdTime))
 		})
 	})
 })

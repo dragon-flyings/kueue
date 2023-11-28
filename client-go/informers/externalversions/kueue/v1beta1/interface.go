@@ -29,6 +29,8 @@ type Interface interface {
 	ClusterQueues() ClusterQueueInformer
 	// LocalQueues returns a LocalQueueInformer.
 	LocalQueues() LocalQueueInformer
+	// ProvisioningRequestConfigs returns a ProvisioningRequestConfigInformer.
+	ProvisioningRequestConfigs() ProvisioningRequestConfigInformer
 	// ResourceFlavors returns a ResourceFlavorInformer.
 	ResourceFlavors() ResourceFlavorInformer
 	// Workloads returns a WorkloadInformer.
@@ -50,12 +52,12 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 
 // AdmissionChecks returns a AdmissionCheckInformer.
 func (v *version) AdmissionChecks() AdmissionCheckInformer {
-	return &admissionCheckInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+	return &admissionCheckInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // ClusterQueues returns a ClusterQueueInformer.
 func (v *version) ClusterQueues() ClusterQueueInformer {
-	return &clusterQueueInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+	return &clusterQueueInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // LocalQueues returns a LocalQueueInformer.
@@ -63,9 +65,14 @@ func (v *version) LocalQueues() LocalQueueInformer {
 	return &localQueueInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
+// ProvisioningRequestConfigs returns a ProvisioningRequestConfigInformer.
+func (v *version) ProvisioningRequestConfigs() ProvisioningRequestConfigInformer {
+	return &provisioningRequestConfigInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
 // ResourceFlavors returns a ResourceFlavorInformer.
 func (v *version) ResourceFlavors() ResourceFlavorInformer {
-	return &resourceFlavorInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+	return &resourceFlavorInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // Workloads returns a WorkloadInformer.
@@ -75,5 +82,5 @@ func (v *version) Workloads() WorkloadInformer {
 
 // WorkloadPriorityClasses returns a WorkloadPriorityClassInformer.
 func (v *version) WorkloadPriorityClasses() WorkloadPriorityClassInformer {
-	return &workloadPriorityClassInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+	return &workloadPriorityClassInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }

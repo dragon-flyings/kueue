@@ -40,21 +40,38 @@ var (
 )
 
 type AssigmentClusterQueueState struct {
-	LastAssignedFlavorIdx  []map[corev1.ResourceName]int
+	LastTriedFlavorIdx     []map[corev1.ResourceName]int
 	CohortGeneration       int64
 	ClusterQueueGeneration int64
 }
 
 func (s *AssigmentClusterQueueState) Clone() *AssigmentClusterQueueState {
 	c := AssigmentClusterQueueState{
-		LastAssignedFlavorIdx:  make([]map[corev1.ResourceName]int, len(s.LastAssignedFlavorIdx)),
+		LastTriedFlavorIdx:     make([]map[corev1.ResourceName]int, len(s.LastTriedFlavorIdx)),
 		CohortGeneration:       s.CohortGeneration,
 		ClusterQueueGeneration: s.ClusterQueueGeneration,
 	}
-	for ps, flavorIdx := range s.LastAssignedFlavorIdx {
-		c.LastAssignedFlavorIdx[ps] = maps.Clone(flavorIdx)
+	for ps, flavorIdx := range s.LastTriedFlavorIdx {
+		c.LastTriedFlavorIdx[ps] = maps.Clone(flavorIdx)
 	}
 	return &c
+}
+
+// PendingFlavors returns whether there are pending flavors to try
+// after the last attempt.
+func (s *AssigmentClusterQueueState) PendingFlavors() bool {
+	if s == nil {
+		// This is only reached in unit tests.
+		return false
+	}
+	for _, podSetIdxs := range s.LastTriedFlavorIdx {
+		for _, idx := range podSetIdxs {
+			if idx != -1 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Info holds a Workload object and some pre-processing.
@@ -260,7 +277,7 @@ func (r Requests) scaleDown(f int64) {
 }
 
 // UpdateStatus updates the condition of a workload with ssa,
-// filelManager being set to managerPrefix + "-" + conditionType
+// fieldManager being set to managerPrefix + "-" + conditionType
 func UpdateStatus(ctx context.Context,
 	c client.Client,
 	wl *kueue.Workload,
@@ -413,7 +430,7 @@ func ReclaimablePodsAreEqual(a, b []kueue.ReclaimablePod) bool {
 	return true
 }
 
-// Returns true if the workload is admitted.
+// IsAdmitted returns true if the workload is admitted.
 func IsAdmitted(w *kueue.Workload) bool {
 	return apimeta.IsStatusConditionTrue(w.Status.Conditions, kueue.WorkloadAdmitted)
 }

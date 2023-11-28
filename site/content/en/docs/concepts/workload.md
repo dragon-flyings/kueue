@@ -105,7 +105,26 @@ As described previously, Kueue has built-in support for workloads created with
 the Job API. But any custom workload API can integrate with Kueue by
 creating a corresponding Workload object for it.
 
+## Dynamic Reclaim
+
+It's a mechanism allowing a currently Admitted workload to release a part of it's Quota Reservation that is no longer needed.
+
+Job integrations communicate this information by setting the `reclaimablePods` status field, enumerating the number of pods per podset for which the Quota Reservation is no longer needed.
+
+```yaml
+
+status:
+  reclaimablePods:
+  - name: podset1
+    count: 2
+  - name: podset2
+    count: 2
+    
+```
+The `count` can only increase while the workload holds a Quota Reservation.
+
 ## What's next
 
 - Learn about [workload priority class](/docs/concepts/workload_priority_class).
 - Learn how to [run jobs](/docs/tasks/run_jobs)
+- Read the [API reference](/docs/reference/kueue.v1beta1/#kueue-x-k8s-io-v1beta1-Workload) for `Workload`

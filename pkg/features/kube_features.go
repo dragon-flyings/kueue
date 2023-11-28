@@ -48,6 +48,20 @@ const (
 	//
 	// Enables flavor fungibility.
 	FlavorFungibility featuregate.Feature = "FlavorFungibility"
+
+	// owner: @trasc
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/1136-provisioning-request-support
+	// alpha: v0.5
+	//
+	// Enables Provisioning Admission Check Controller.
+	ProvisioningACC featuregate.Feature = "ProvisioningACC"
+
+	// owner: @pbundyra
+	// kep: https://github.com/kubernetes-sigs/kueue/pull/1300
+	// alpha: v0.6
+	//
+	// Enables Kueue visibility on demand
+	VisibilityOnDemand featuregate.Feature = "VisibilityOnDemand"
 )
 
 func init() {
@@ -61,16 +75,18 @@ func init() {
 // Entries are separated from each other with blank lines to avoid sweeping gofmt changes
 // when adding or removing one entry.
 var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
-	PartialAdmission:  {Default: true, PreRelease: featuregate.Beta},
-	QueueVisibility:   {Default: false, PreRelease: featuregate.Alpha},
-	FlavorFungibility: {Default: true, PreRelease: featuregate.Beta},
+	PartialAdmission:   {Default: true, PreRelease: featuregate.Beta},
+	QueueVisibility:    {Default: false, PreRelease: featuregate.Alpha},
+	FlavorFungibility:  {Default: true, PreRelease: featuregate.Beta},
+	ProvisioningACC:    {Default: false, PreRelease: featuregate.Alpha},
+	VisibilityOnDemand: {Default: false, PreRelease: featuregate.Alpha},
 }
 
 func SetFeatureGateDuringTest(tb testing.TB, f featuregate.Feature, value bool) func() {
 	return featuregatetesting.SetFeatureGateDuringTest(tb, utilfeature.DefaultFeatureGate, f, value)
 }
 
-// Helper for `utilfeature.DefaultFeatureGate.Enabled()`
+// Enabled is helper for `utilfeature.DefaultFeatureGate.Enabled()`
 func Enabled(f featuregate.Feature) bool {
 	return utilfeature.DefaultFeatureGate.Enabled(f)
 }

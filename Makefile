@@ -108,7 +108,7 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 		rbac:roleName=manager-role output:rbac:artifacts:config=config/components/rbac\
 		crd:generateEmbeddedObjectMeta=true output:crd:artifacts:config=config/components/crd/bases\
 		webhook output:webhook:artifacts:config=config/components/webhook\
-		paths="./..."
+		paths="./apis/..."
 
 .PHONY: update-helm
 update-helm: manifests yq
@@ -116,7 +116,7 @@ update-helm: manifests yq
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations and client-go libraries.
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./apis/..."
 	./hack/update-codegen.sh $(GO_CMD)
 
 .PHONY: fmt
@@ -136,6 +136,10 @@ gomod-verify:
 	$(GO_CMD) mod tidy
 	git --no-pager diff --exit-code go.mod go.sum
 
+.PHONY: gomod-download
+gomod-download:
+	$(GO_CMD) mod download
+
 .PHONY: toc-update
 toc-update:
 	./hack/update-toc.sh
@@ -149,21 +153,21 @@ vet: ## Run go vet against code.
 	$(GO_CMD) vet ./...
 
 .PHONY: test
-test: generate gotestsum ## Run tests.
+test: gotestsum ## Run tests.
 	$(GOTESTSUM) --junitfile $(ARTIFACTS)/junit.xml -- $(GO_TEST_FLAGS) $(shell $(GO_CMD) list ./... | grep -v '/test/') -coverpkg=./... -coverprofile $(ARTIFACTS)/cover.out
 
 .PHONY: test-integration
-test-integration: manifests generate envtest ginkgo mpi-operator-crd ray-operator-crd jobset-operator-crd kf-training-operator-crd ## Run tests.
+test-integration: gomod-download envtest ginkgo mpi-operator-crd ray-operator-crd jobset-operator-crd kf-training-operator-crd  cluster-autoscaler-crd ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
 	$(GINKGO) $(GINKGO_ARGS) --junit-report=junit.xml --output-dir=$(ARTIFACTS) -v $(INTEGRATION_TARGET)
 
 CREATE_KIND_CLUSTER ?= true
 .PHONY: test-e2e
-test-e2e: kustomize manifests generate ginkgo run-test-e2e-$(E2E_KIND_VERSION:kindest/node:v%=%)
+test-e2e: kustomize ginkgo run-test-e2e-$(E2E_KIND_VERSION:kindest/node:v%=%)
 
 E2E_TARGETS := $(addprefix run-test-e2e-,${E2E_K8S_VERSIONS})
 .PHONY: test-e2e-all
-test-e2e-all: kustomize manifests generate envtest ginkgo $(E2E_TARGETS)
+test-e2e-all: ginkgo $(E2E_TARGETS)
 
 FORCE:
 
@@ -177,8 +181,8 @@ ci-lint: golangci-lint
 	$(GOLANGCI_LINT) run --timeout 15m0s
 
 .PHONY: verify
-verify: gomod-verify vet ci-lint fmt-verify toc-verify manifests generate update-helm
-	git --no-pager diff --exit-code config/components apis charts/kueue/templates client-go
+verify: gomod-verify vet ci-lint fmt-verify toc-verify manifests generate update-helm generate-apiref
+	git --no-pager diff --exit-code config/components apis charts/kueue/templates client-go site/content/en/docs/reference
 
 ##@ Build
 
@@ -314,6 +318,11 @@ HELM = $(PROJECT_DIR)/bin/helm
 helm: ## Download helm locally if necessary.
 	@GOBIN=$(PROJECT_DIR)/bin GO111MODULE=on $(GO_CMD) install helm.sh/helm/v3/cmd/helm@v3.12.1
 
+GENREF = $(PROJECT_DIR)/bin/genref
+.PHONY: genref
+genref: ## Download genref locally if necessary.
+	@GOBIN=$(PROJECT_DIR)/bin $(GO_CMD) install github.com/kubernetes-sigs/reference-docs/genref@v0.28.0
+
 MPIROOT = $(shell $(GO_CMD) list -m -f "{{.Dir}}" github.com/kubeflow/mpi-operator)
 .PHONY: mpi-operator-crd
 mpi-operator-crd:
@@ -337,3 +346,14 @@ JOBSETROOT = $(shell $(GO_CMD) list -m -f "{{.Dir}}" sigs.k8s.io/jobset)
 jobset-operator-crd:
 	mkdir -p $(PROJECT_DIR)/dep-crds/jobset-operator/
 	cp -f $(JOBSETROOT)/config/components/crd/bases/* $(PROJECT_DIR)/dep-crds/jobset-operator/
+
+
+CAROOT = $(shell $(GO_CMD) list -m -f "{{.Dir}}" k8s.io/autoscaler/cluster-autoscaler)
+.PHONY: cluster-autoscaler-crd
+cluster-autoscaler-crd:
+	mkdir -p $(PROJECT_DIR)/dep-crds/cluster-autoscaler/
+	cp -f $(CAROOT)/config/crd/* $(PROJECT_DIR)/dep-crds/cluster-autoscaler/
+
+.PHONY: generate-apiref
+generate-apiref: genref
+	cd  $(PROJECT_DIR)/site/genref/ && $(GENREF)  -o $(PROJECT_DIR)/site/content/en/docs/reference

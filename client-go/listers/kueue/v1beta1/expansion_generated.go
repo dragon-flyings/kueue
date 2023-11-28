@@ -21,17 +21,9 @@ package v1beta1
 // AdmissionCheckLister.
 type AdmissionCheckListerExpansion interface{}
 
-// AdmissionCheckNamespaceListerExpansion allows custom methods to be added to
-// AdmissionCheckNamespaceLister.
-type AdmissionCheckNamespaceListerExpansion interface{}
-
 // ClusterQueueListerExpansion allows custom methods to be added to
 // ClusterQueueLister.
 type ClusterQueueListerExpansion interface{}
-
-// ClusterQueueNamespaceListerExpansion allows custom methods to be added to
-// ClusterQueueNamespaceLister.
-type ClusterQueueNamespaceListerExpansion interface{}
 
 // LocalQueueListerExpansion allows custom methods to be added to
 // LocalQueueLister.
@@ -41,13 +33,13 @@ type LocalQueueListerExpansion interface{}
 // LocalQueueNamespaceLister.
 type LocalQueueNamespaceListerExpansion interface{}
 
+// ProvisioningRequestConfigListerExpansion allows custom methods to be added to
+// ProvisioningRequestConfigLister.
+type ProvisioningRequestConfigListerExpansion interface{}
+
 // ResourceFlavorListerExpansion allows custom methods to be added to
 // ResourceFlavorLister.
 type ResourceFlavorListerExpansion interface{}
-
-// ResourceFlavorNamespaceListerExpansion allows custom methods to be added to
-// ResourceFlavorNamespaceLister.
-type ResourceFlavorNamespaceListerExpansion interface{}
 
 // WorkloadListerExpansion allows custom methods to be added to
 // WorkloadLister.
@@ -60,7 +52,3 @@ type WorkloadNamespaceListerExpansion interface{}
 // WorkloadPriorityClassListerExpansion allows custom methods to be added to
 // WorkloadPriorityClassLister.
 type WorkloadPriorityClassListerExpansion interface{}
-
-// WorkloadPriorityClassNamespaceListerExpansion allows custom methods to be added to
-// WorkloadPriorityClassNamespaceLister.
-type WorkloadPriorityClassNamespaceListerExpansion interface{}

@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/constants"
 	controllerconsts "sigs.k8s.io/kueue/pkg/controller/constants"
 	"sigs.k8s.io/kueue/pkg/controller/jobframework"
+	"sigs.k8s.io/kueue/pkg/podset"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingjob "sigs.k8s.io/kueue/pkg/util/testingjobs/job"
 )
@@ -167,7 +168,7 @@ func TestPodsReady(t *testing.T) {
 func TestPodSetsInfo(t *testing.T) {
 	testcases := map[string]struct {
 		job                  *Job
-		runInfo, restoreInfo []jobframework.PodSetInfo
+		runInfo, restoreInfo []podset.PodSetInfo
 		wantUnsuspended      *batchv1.Job
 		wantRunError         error
 	}{
@@ -175,11 +176,25 @@ func TestPodSetsInfo(t *testing.T) {
 			job: (*Job)(utiltestingjob.MakeJob("job", "ns").
 				Parallelism(1).
 				NodeSelector("orig-key", "orig-val").
+				Toleration(corev1.Toleration{
+					Key:      "orig-t-key",
+					Operator: corev1.TolerationOpEqual,
+					Value:    "orig-t-val",
+					Effect:   corev1.TaintEffectNoSchedule,
+				}).
 				Obj()),
-			runInfo: []jobframework.PodSetInfo{
+			runInfo: []podset.PodSetInfo{
 				{
 					NodeSelector: map[string]string{
 						"new-key": "new-val",
+					},
+					Tolerations: []corev1.Toleration{
+						{
+							Key:      "new-t-key",
+							Operator: corev1.TolerationOpEqual,
+							Value:    "new-t-val",
+							Effect:   corev1.TaintEffectNoSchedule,
+						},
 					},
 				},
 			},
@@ -187,12 +202,32 @@ func TestPodSetsInfo(t *testing.T) {
 				Parallelism(1).
 				NodeSelector("orig-key", "orig-val").
 				NodeSelector("new-key", "new-val").
+				Toleration(corev1.Toleration{
+					Key:      "orig-t-key",
+					Operator: corev1.TolerationOpEqual,
+					Value:    "orig-t-val",
+					Effect:   corev1.TaintEffectNoSchedule,
+				}).
+				Toleration(corev1.Toleration{
+					Key:      "new-t-key",
+					Operator: corev1.TolerationOpEqual,
+					Value:    "new-t-val",
+					Effect:   corev1.TaintEffectNoSchedule,
+				}).
 				Suspend(false).
 				Obj(),
-			restoreInfo: []jobframework.PodSetInfo{
+			restoreInfo: []podset.PodSetInfo{
 				{
 					NodeSelector: map[string]string{
 						"orig-key": "orig-val",
+					},
+					Tolerations: []corev1.Toleration{
+						{
+							Key:      "orig-t-key",
+							Operator: corev1.TolerationOpEqual,
+							Value:    "orig-t-val",
+							Effect:   corev1.TaintEffectNoSchedule,
+						},
 					},
 				},
 			},
@@ -202,20 +237,20 @@ func TestPodSetsInfo(t *testing.T) {
 				Parallelism(1).
 				NodeSelector("orig-key", "orig-val").
 				Obj()),
-			runInfo: []jobframework.PodSetInfo{
+			runInfo: []podset.PodSetInfo{
 				{
 					NodeSelector: map[string]string{
 						"orig-key": "new-val",
 					},
 				},
 			},
-			wantRunError: jobframework.ErrInvalidPodSetUpdate,
+			wantRunError: podset.ErrInvalidPodSetUpdate,
 			wantUnsuspended: utiltestingjob.MakeJob("job", "ns").
 				Parallelism(1).
 				NodeSelector("orig-key", "orig-val").
 				Suspend(false).
 				Obj(),
-			restoreInfo: []jobframework.PodSetInfo{
+			restoreInfo: []podset.PodSetInfo{
 				{
 					NodeSelector: map[string]string{
 						"orig-key": "orig-val",
@@ -228,7 +263,7 @@ func TestPodSetsInfo(t *testing.T) {
 				Parallelism(5).
 				SetAnnotation(JobMinParallelismAnnotation, "2").
 				Obj()),
-			runInfo: []jobframework.PodSetInfo{
+			runInfo: []podset.PodSetInfo{
 				{
 					Count: 2,
 				},
@@ -238,7 +273,7 @@ func TestPodSetsInfo(t *testing.T) {
 				SetAnnotation(JobMinParallelismAnnotation, "2").
 				Suspend(false).
 				Obj(),
-			restoreInfo: []jobframework.PodSetInfo{
+			restoreInfo: []podset.PodSetInfo{
 				{
 					Count: 5,
 				},
@@ -249,18 +284,18 @@ func TestPodSetsInfo(t *testing.T) {
 				Parallelism(5).
 				SetAnnotation(JobMinParallelismAnnotation, "2").
 				Obj()),
-			runInfo: []jobframework.PodSetInfo{},
+			runInfo: []podset.PodSetInfo{},
 			wantUnsuspended: utiltestingjob.MakeJob("job", "ns").
 				Parallelism(5).
 				SetAnnotation(JobMinParallelismAnnotation, "2").
 				Suspend(false).
 				Obj(),
-			restoreInfo: []jobframework.PodSetInfo{
+			restoreInfo: []podset.PodSetInfo{
 				{
 					Count: 5,
 				},
 			},
-			wantRunError: jobframework.ErrInvalidPodsetInfo,
+			wantRunError: podset.ErrInvalidPodsetInfo,
 		},
 	}
 	for name, tc := range testcases {
@@ -326,7 +361,7 @@ func TestPodSets(t *testing.T) {
 var (
 	jobCmpOpts = []cmp.Option{
 		cmpopts.EquateEmpty(),
-		cmpopts.IgnoreFields(batchv1.Job{}, "TypeMeta", "ObjectMeta"),
+		cmpopts.IgnoreFields(batchv1.Job{}, "TypeMeta", "ObjectMeta.OwnerReferences", "ObjectMeta.ResourceVersion", "ObjectMeta.Annotations"),
 	}
 	workloadCmpOpts = []cmp.Option{
 		cmpopts.EquateEmpty(),
@@ -692,7 +727,7 @@ func TestReconciler(t *testing.T) {
 						Type:    kueue.WorkloadFinished,
 						Status:  metav1.ConditionTrue,
 						Reason:  "FailedToStart",
-						Message: `invalid admission check PodSetUpdate: conflict for nodeSelector: conflict for key=provisioning, value1=on-demand, value2=spot`,
+						Message: `invalid admission check PodSetUpdate: conflict for nodeSelector: conflict for key=provisioning, value1=spot, value2=on-demand`,
 					}).
 					Obj(),
 			},
@@ -839,6 +874,26 @@ func TestReconciler(t *testing.T) {
 			},
 			wantErr: jobframework.ErrNoMatchingWorkloads,
 		},
+		"non-matching non-admitted workload is updated": {
+			reconcilerOptions: []jobframework.Option{
+				jobframework.WithManageJobsWithoutQueueName(true),
+			},
+			job:     *baseJobWrapper.DeepCopy(),
+			wantJob: *baseJobWrapper.DeepCopy(),
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("a", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 5).Request(corev1.ResourceCPU, "1").Obj()).
+					Priority(0).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("a", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("foo").
+					Priority(0).
+					Obj(),
+			},
+		},
 		"suspended job with partial admission and admitted workload is unsuspended": {
 			reconcilerOptions: []jobframework.Option{
 				jobframework.WithManageJobsWithoutQueueName(true),
@@ -914,6 +969,72 @@ func TestReconciler(t *testing.T) {
 					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
 					Queue("test-queue").
 					Priority(0).
+					Labels(map[string]string{
+						controllerconsts.JobUIDLabel: "test-uid",
+					}).
+					Obj(),
+			},
+		},
+		"the workload is updated when queue name has changed for suspended job": {
+			job: *baseJobWrapper.
+				Clone().
+				Suspend(true).
+				Queue("test-queue-new").
+				UID("test-uid").
+				Obj(),
+			wantJob: *baseJobWrapper.
+				Clone().
+				Queue("test-queue-new").
+				UID("test-uid").
+				Obj(),
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("job", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue").
+					Priority(0).
+					Labels(map[string]string{
+						controllerconsts.JobUIDLabel: "test-uid",
+					}).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("job", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("test-queue-new").
+					Priority(0).
+					Labels(map[string]string{
+						controllerconsts.JobUIDLabel: "test-uid",
+					}).
+					Obj(),
+			},
+		},
+		"the workload is updated when priority class has changed for suspended job": {
+			job: *baseJobWrapper.
+				Clone().
+				Suspend(true).
+				UID("test-uid").
+				Obj(),
+			wantJob: *baseJobWrapper.
+				Clone().
+				UID("test-uid").
+				Obj(),
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("job", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("foo").
+					Priority(0).
+					PriorityClass("new-priority-class").
+					Labels(map[string]string{
+						controllerconsts.JobUIDLabel: "test-uid",
+					}).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("job", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 10).Request(corev1.ResourceCPU, "1").Obj()).
+					Queue("foo").
+					Priority(0).
+					PriorityClass("new-priority-class").
 					Labels(map[string]string{
 						controllerconsts.JobUIDLabel: "test-uid",
 					}).
