@@ -24,14 +24,15 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -95,9 +96,10 @@ type WorkloadReconciler struct {
 	client           client.Client
 	watchers         []WorkloadUpdateWatcher
 	podsReadyTimeout *time.Duration
+	recorder         record.EventRecorder
 }
 
-func NewWorkloadReconciler(client client.Client, queues *queue.Manager, cache *cache.Cache, opts ...Option) *WorkloadReconciler {
+func NewWorkloadReconciler(client client.Client, queues *queue.Manager, cache *cache.Cache, recorder record.EventRecorder, opts ...Option) *WorkloadReconciler {
 	options := defaultOptions
 	for _, opt := range opts {
 		opt(&options)
@@ -110,6 +112,7 @@ func NewWorkloadReconciler(client client.Client, queues *queue.Manager, cache *c
 		cache:            cache,
 		watchers:         options.watchers,
 		podsReadyTimeout: options.podsReadyTimeout,
+		recorder:         recorder,
 	}
 }
 
@@ -153,7 +156,15 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	if workload.SyncAdmittedCondition(&wl) {
-		return ctrl.Result{}, workload.ApplyAdmissionStatus(ctx, r.client, &wl, true)
+		if err := workload.ApplyAdmissionStatus(ctx, r.client, &wl, true); err != nil {
+			return ctrl.Result{}, err
+		}
+		if workload.IsAdmitted(&wl) {
+			c := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadQuotaReserved)
+			r.recorder.Eventf(&wl, corev1.EventTypeNormal, "Admitted", "Admitted by ClusterQueue %v, wait time since reservation was %.0fs", wl.Status.Admission.ClusterQueue, time.Since(c.LastTransitionTime.Time).Seconds())
+
+		}
+		return ctrl.Result{}, nil
 	}
 
 	if workload.HasQuotaReservation(&wl) {
@@ -161,7 +172,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, err
 		}
 
-		if reservationRemoved, err := r.reconcileReservationOnClusterQueueDeletion(ctx, &wl, cqName); reservationRemoved || err != nil {
+		if updated, err := r.reconcileOnClusterQueueActiveState(ctx, &wl, cqName); updated || err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -222,23 +233,38 @@ func (r *WorkloadReconciler) reconcileSyncAdmissionChecks(ctx context.Context, w
 	return false, nil
 }
 
-func (r *WorkloadReconciler) reconcileReservationOnClusterQueueDeletion(ctx context.Context, wl *kueue.Workload, cqName string) (bool, error) {
-	if workload.IsAdmitted(wl) {
-		return false, nil
-	}
-
+func (r *WorkloadReconciler) reconcileOnClusterQueueActiveState(ctx context.Context, wl *kueue.Workload, cqName string) (bool, error) {
 	queue := kueue.ClusterQueue{}
 	err := r.client.Get(ctx, types.NamespacedName{Name: cqName}, &queue)
 	if client.IgnoreNotFound(err) != nil {
 		return false, err
 	}
 
-	if apierrors.IsNotFound(err) || !queue.DeletionTimestamp.IsZero() {
-		log := ctrl.LoggerFrom(ctx)
-		log.V(3).Info("Workload is inadmissible because ClusterQueue is terminating or missing", "clusterQueue", klog.KRef("", cqName))
+	queueStopPolicy := ptr.Deref(queue.Spec.StopPolicy, kueue.None)
+
+	log := ctrl.LoggerFrom(ctx)
+	if workload.IsAdmitted(wl) {
+		if queueStopPolicy != kueue.HoldAndDrain {
+			return false, nil
+		}
+		log.V(3).Info("Workload is evicted because the ClusterQueue is stopped", "clusterQueue", klog.KRef("", cqName))
+		workload.SetEvictedCondition(wl, kueue.WorkloadEvictedByClusterQueueStopped, "The ClusterQueue is stopped")
+		err := workload.ApplyAdmissionStatus(ctx, r.client, wl, true)
+		return true, client.IgnoreNotFound(err)
+	}
+
+	if err != nil || !queue.DeletionTimestamp.IsZero() {
+		log.V(3).Info("Workload is inadmissible because the ClusterQueue is terminating or missing", "clusterQueue", klog.KRef("", cqName))
 		workload.UnsetQuotaReservationWithCondition(wl, "Inadmissible", fmt.Sprintf("ClusterQueue %s is terminating or missing", cqName))
 		return true, workload.ApplyAdmissionStatus(ctx, r.client, wl, true)
 	}
+
+	if queueStopPolicy != kueue.None {
+		log.V(3).Info("Workload is inadmissible because the ClusterQueue is stopped", "clusterQueue", klog.KRef("", cqName))
+		workload.UnsetQuotaReservationWithCondition(wl, "Inadmissible", fmt.Sprintf("ClusterQueue %s is stopped", cqName))
+		return true, workload.ApplyAdmissionStatus(ctx, r.client, wl, true)
+	}
+
 	return false, nil
 }
 
@@ -376,6 +402,7 @@ func (r *WorkloadReconciler) Update(e event.UpdateEvent) bool {
 	status := workloadStatus(wl)
 	log := r.log.WithValues("workload", klog.KObj(wl), "queue", wl.Spec.QueueName, "status", status)
 	ctx := ctrl.LoggerInto(context.Background(), log)
+	active := ptr.Deref(wl.Spec.Active, true)
 
 	prevQueue := oldWl.Spec.QueueName
 	if prevQueue != wl.Spec.QueueName {
@@ -398,7 +425,10 @@ func (r *WorkloadReconciler) Update(e event.UpdateEvent) bool {
 	workload.AdjustResources(ctrl.LoggerInto(ctx, log), r.client, wlCopy)
 
 	switch {
-	case status == finished:
+	case status == finished || !active:
+		if !active {
+			log.V(2).Info("Workload will not be queued because the workload is not active", "workload", klog.KObj(wl))
+		}
 		// The workload could have been in the queues if we missed an event.
 		r.queues.DeleteWorkload(wl)
 
@@ -602,7 +632,9 @@ func (w *workloadCqHandler) Update(ctx context.Context, ev event.UpdateEvent, wq
 		return
 	}
 
-	if !newCq.DeletionTimestamp.IsZero() || !slices.CmpNoOrder(oldCq.Spec.AdmissionChecks, newCq.Spec.AdmissionChecks) {
+	if !newCq.DeletionTimestamp.IsZero() ||
+		!slices.CmpNoOrder(oldCq.Spec.AdmissionChecks, newCq.Spec.AdmissionChecks) ||
+		oldCq.Spec.StopPolicy != newCq.Spec.StopPolicy {
 		w.queueReconcileForWorkloads(ctx, newCq.Name, wq)
 	}
 }

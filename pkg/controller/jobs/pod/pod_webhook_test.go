@@ -282,6 +282,69 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+func TestGetRoleHash(t *testing.T) {
+	testCases := map[string]struct {
+		pods []*Pod
+		// If true, hash for all the pods in test should be equal
+		wantEqualHash bool
+		wantErr       error
+	}{
+		"kueue.x-k8s.io/* labels shouldn't affect the role": {
+			pods: []*Pod{
+				{pod: *testingpod.MakePod("pod1", "test-ns").
+					Label("kueue.x-k8s.io/managed", "true").
+					Obj()},
+				{pod: *testingpod.MakePod("pod2", "test-ns").
+					Obj()},
+			},
+			wantEqualHash: true,
+		},
+		"volume name shouldn't affect the role": {
+			pods: []*Pod{
+				{pod: *testingpod.MakePod("pod1", "test-ns").
+					Volume(corev1.Volume{
+						Name: "volume1",
+					}).
+					Obj()},
+				{pod: *testingpod.MakePod("pod1", "test-ns").
+					Volume(corev1.Volume{
+						Name: "volume2",
+					}).
+					Obj()},
+			},
+			wantEqualHash: true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+
+			var previousHash string
+			for i := range tc.pods {
+				hash, err := getRoleHash(tc.pods[i].pod)
+
+				if diff := cmp.Diff(tc.wantErr, err); diff != "" {
+					t.Errorf("Unexpected error (-want,+got):\n%s", diff)
+				}
+
+				if previousHash != "" {
+					if tc.wantEqualHash {
+						if previousHash != hash {
+							t.Errorf("Hash of pod shapes shouldn't be different %s!=%s", previousHash, hash)
+						}
+					} else {
+						if previousHash == hash {
+							t.Errorf("Hash of pod shapes shouldn't be equal %s==%s", previousHash, hash)
+						}
+					}
+				}
+
+				previousHash = hash
+			}
+		})
+	}
+}
+
 func TestValidateCreate(t *testing.T) {
 	testCases := map[string]struct {
 		pod       *corev1.Pod
@@ -470,6 +533,41 @@ func TestValidateUpdate(t *testing.T) {
 				&field.Error{
 					Type:  field.ErrorTypeInvalid,
 					Field: "metadata.labels[kueue.x-k8s.io/pod-group-name]",
+				},
+			}.ToAggregate(),
+		},
+		"retriable in group annotation is removed": {
+			oldPod: testingpod.MakePod("test-pod", "test-ns").
+				Group("test-group").
+				GroupTotalCount("2").
+				Annotation("kueue.x-k8s.io/retriable-in-group", "false").
+				Obj(),
+			newPod: testingpod.MakePod("test-pod", "test-ns").
+				Group("test-group").
+				GroupTotalCount("2").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: "metadata.annotations[kueue.x-k8s.io/retriable-in-group]",
+				},
+			}.ToAggregate(),
+		},
+		"retriable in group annotation is changed from false to true": {
+			oldPod: testingpod.MakePod("test-pod", "test-ns").
+				Group("test-group").
+				GroupTotalCount("2").
+				Annotation("kueue.x-k8s.io/retriable-in-group", "false").
+				Obj(),
+			newPod: testingpod.MakePod("test-pod", "test-ns").
+				Group("test-group").
+				GroupTotalCount("2").
+				Annotation("kueue.x-k8s.io/retriable-in-group", "true").
+				Obj(),
+			wantErr: field.ErrorList{
+				&field.Error{
+					Type:  field.ErrorTypeForbidden,
+					Field: "metadata.annotations[kueue.x-k8s.io/retriable-in-group]",
 				},
 			}.ToAggregate(),
 		},

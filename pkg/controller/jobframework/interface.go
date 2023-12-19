@@ -59,14 +59,23 @@ type GenericJob interface {
 
 type JobWithReclaimablePods interface {
 	// ReclaimablePods returns the list of reclaimable pods.
-	ReclaimablePods() []kueue.ReclaimablePod
+	ReclaimablePods() ([]kueue.ReclaimablePod, error)
 }
+
+type StopReason int
+
+const (
+	StopReasonWorkloadDeleted StopReason = iota
+	StopReasonWorkloadEvicted
+	StopReasonNoMatchingWorkload
+	StopReasonNotAdmitted
+)
 
 type JobWithCustomStop interface {
 	// Stop implements a custom stop procedure.
 	// The function should be idempotent: not do any API calls if the job is already stopped.
 	// Returns whether the Job stopped with this call or an error
-	Stop(ctx context.Context, c client.Client, podSetsInfo []podset.PodSetInfo, eventMsg string) (bool, error)
+	Stop(ctx context.Context, c client.Client, podSetsInfo []podset.PodSetInfo, stopReason StopReason, eventMsg string) (bool, error)
 }
 
 // JobWithFinalize interface should be implemented by generic jobs,
@@ -119,4 +128,9 @@ func workloadPriorityClassName(job GenericJob) string {
 		return workloadPriorityClassLabel
 	}
 	return ""
+}
+
+func prebuiltWorkload(job GenericJob) (string, bool) {
+	name, found := job.Object().GetLabels()[constants.PrebuiltWorkloadLabel]
+	return name, found
 }

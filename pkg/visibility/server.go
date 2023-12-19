@@ -41,6 +41,10 @@ type server struct {
 	*genericapiserver.GenericAPIServer
 }
 
+// +kubebuilder:rbac:groups=flowcontrol.apiserver.k8s.io,resources=prioritylevelconfigurations,verbs=list;watch
+// +kubebuilder:rbac:groups=flowcontrol.apiserver.k8s.io,resources=flowschemas,verbs=list;watch
+//+kubebuilder:rbac:groups=flowcontrol.apiserver.k8s.io,resources=flowschemas/status,verbs=patch
+
 // CreateAndStartVisibilityServer creates visibility server injecting KueueManager and starts it
 func CreateAndStartVisibilityServer(kueueMgr *queue.Manager, ctx context.Context) {
 	config := newVisibilityServerConfig()

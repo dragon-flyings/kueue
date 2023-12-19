@@ -693,6 +693,20 @@ lower priority first.</p>
    <p>admissionChecks lists the AdmissionChecks required by this ClusterQueue</p>
 </td>
 </tr>
+<tr><td><code>stopPolicy</code><br/>
+<a href="#kueue-x-k8s-io-v1beta1-StopPolicy"><code>StopPolicy</code></a>
+</td>
+<td>
+   <p>stopPolicy - if set to a value different than None, the ClusterQueue is considered Inactive, no new reservation being
+made.</p>
+<p>Depending on its value, its associated workloads will:</p>
+<ul>
+<li>None - Workloads are admitted</li>
+<li>HoldAndDrain - Admitted workloads are evicted and Reserving workloads will cancel the reservation.</li>
+<li>Hold - Admitted workloads will run to completion and Reserving workloads will cancel the reservation.</li>
+</ul>
+</td>
+</tr>
 </tbody>
 </table>
 
@@ -1541,6 +1555,18 @@ words, it's the used quota that is over the nominalQuota.</p>
 </tbody>
 </table>
 
+## `StopPolicy`     {#kueue-x-k8s-io-v1beta1-StopPolicy}
+    
+(Alias of `string`)
+
+**Appears in:**
+
+- [ClusterQueueSpec](#kueue-x-k8s-io-v1beta1-ClusterQueueSpec)
+
+
+
+
+
 ## `WorkloadSpec`     {#kueue-x-k8s-io-v1beta1-WorkloadSpec}
     
 
@@ -1605,6 +1631,20 @@ If priorityClassName is specified, priority must not be null.</p>
    <p>priorityClassSource determines whether the priorityClass field refers to a pod PriorityClass or kueue.x-k8s.io/workloadpriorityclass.
 Workload's PriorityClass can accept the name of a pod priorityClass or a workloadPriorityClass.
 When using pod PriorityClass, a priorityClassSource field has the scheduling.k8s.io/priorityclass value.</p>
+</td>
+</tr>
+<tr><td><code>active</code> <B>[Required]</B><br/>
+<code>bool</code>
+</td>
+<td>
+   <p>Active determines if a workload can be admitted into a queue.
+Changing active from true to false will evict any running workloads.
+Possible values are:</p>
+<ul>
+<li>false: indicates that a workload should never be admitted and evicts running workloads</li>
+<li>true: indicates that a workload can be evaluated for admission into it's respective queue.</li>
+</ul>
+<p>Defaults to true</p>
 </td>
 </tr>
 </tbody>

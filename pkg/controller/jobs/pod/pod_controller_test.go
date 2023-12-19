@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -143,16 +144,21 @@ func TestReconciler(t *testing.T) {
 		Request(corev1.ResourceCPU, "1").
 		Image("", nil)
 
+	now := time.Now()
+
 	testCases := map[string]struct {
-		initObjects     []client.Object
-		pods            []corev1.Pod
-		wantPods        []corev1.Pod
-		workloads       []kueue.Workload
-		wantWorkloads   []kueue.Workload
-		wantErr         error
+		initObjects   []client.Object
+		pods          []corev1.Pod
+		wantPods      []corev1.Pod
+		workloads     []kueue.Workload
+		wantWorkloads []kueue.Workload
+		// wantErrs should be the same length and order as pods
+		wantErrs        []error
 		workloadCmpOpts []cmp.Option
 		// If true, the test will delete workloads before running reconcile
 		deleteWorkloads bool
+		// Names of pods, for which reconcile should be skipped
+		skipReconcileForPods map[string]struct{}
 	}{
 		"scheduling gate is removed and node selector is added if workload is admitted": {
 			initObjects: []client.Object{
@@ -210,7 +216,7 @@ func TestReconciler(t *testing.T) {
 					Admitted(true).
 					Obj(),
 			},
-			wantErr:         jobframework.ErrNoMatchingWorkloads,
+			wantErrs:        []error{jobframework.ErrNoMatchingWorkloads},
 			workloadCmpOpts: defaultWorkloadCmpOpts,
 		},
 		"the workload is created when queue name is set": {
@@ -657,6 +663,7 @@ func TestReconciler(t *testing.T) {
 					Queue("user-queue").
 					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
 					Admitted(true).
+					ReclaimablePods(kueue.ReclaimablePod{Name: "b990493b", Count: 1}).
 					Obj(),
 			},
 			workloadCmpOpts: defaultWorkloadCmpOpts,
@@ -966,6 +973,7 @@ func TestReconciler(t *testing.T) {
 					Queue("test-queue").
 					Group("test-group").
 					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
 					Obj(),
 			},
 			wantPods: []corev1.Pod{},
@@ -1406,10 +1414,648 @@ func TestReconciler(t *testing.T) {
 			},
 			workloadCmpOpts: defaultWorkloadCmpOpts,
 		},
+		"workload is not deleted if one pod role is absent from the cluster": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					Delete().
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					Delete().
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("absent-pod-role", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("absent-pod-role", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"if pod group is finished and wl is deleted, new workload shouldn't be created": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			workloads:       []kueue.Workload{},
+			wantWorkloads:   []kueue.Workload{},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"if pod in group is scheduling gated and wl is deleted, workload should be recreated": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			workloads: []kueue.Workload{},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltesting.MakePodSet("b990493b", 2).
+							SchedulingGates(corev1.PodSchedulingGate{Name: "kueue.x-k8s.io/admission"}).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					Priority(0).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+			// On the second reconciliation, the generic reconciler will try to update reclaimable
+			// pods. Since that operation uses server-side apply, which the fake client doesn't
+			// support, we're skipping reconcile for the second pod.
+			skipReconcileForPods: map[string]struct{}{"pod2": {}},
+		},
+		"if there's not enough non-failed pods in the group, workload should not be recreated": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+			},
+			workloads:       []kueue.Workload{},
+			wantWorkloads:   []kueue.Workload{},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"pod group is considered finished if there is an unretriable pod and no running pods": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Annotation("kueue.x-k8s.io/retriable-in-group", "false").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod3").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					Image("test-image-role2", nil).
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Annotation("kueue.x-k8s.io/retriable-in-group", "false").
+					Label("kueue.x-k8s.io/managed", "true").
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod3").
+					Label("kueue.x-k8s.io/managed", "true").
+					Group("test-group").
+					Image("test-image-role2", nil).
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("4389b941", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("4389b941", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Condition(
+						metav1.Condition{
+							Type:    kueue.WorkloadFinished,
+							Status:  metav1.ConditionTrue,
+							Reason:  "JobFinished",
+							Message: "Pods succeeded: 1/3.",
+						},
+					).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"reclaimable pods updated for pod group": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodRunning).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod3").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					Image("test-image-role2", nil).
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodFailed).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodRunning).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod3").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					Image("test-image-role2", nil).
+					GroupTotalCount("3").
+					StatusPhase(corev1.PodSucceeded).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("4389b941", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("4389b941", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					ReclaimablePods(kueue.ReclaimablePod{Name: "4389b941", Count: 1}).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"excess pods before wl creation, youngest pods are deleted": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now.Add(time.Minute)).
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now).
+					Obj(),
+			},
+			workloads: []kueue.Workload{},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							SchedulingGates(corev1.PodSchedulingGate{Name: "kueue.x-k8s.io/admission"}).
+							Obj(),
+					).
+					Queue("user-queue").
+					Priority(0).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		"excess pods before admission, youngest pods are deleted": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now.Add(time.Minute)).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod3").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					CreationTimestamp(now.Add(time.Minute * 2)).
+					GroupTotalCount("2").
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now.Add(time.Minute)).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("b990493b", 2).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		// In this case, group-total-count is equal to the number of pods in the cluster.
+		// But one of the roles is missing, and another role has an excess pod.
+		"excess pods in pod set after admission, youngest pods are deleted": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					CreationTimestamp(now.Add(time.Minute * 2)).
+					GroupTotalCount("2").
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					Group("test-group").
+					GroupTotalCount("2").
+					CreationTimestamp(now).
+					Obj(),
+			},
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("aaf269e6", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").
+					PodSets(
+						*utiltesting.MakePodSet("aaf269e6", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							Obj(),
+					).
+					Queue("user-queue").
+					ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
+					Admitted(true).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
+		// If an excess pod is already deleted and finalized, but an external finalizer blocks
+		// pod deletion, kueue should ignore such a pod, when creating a workload.
+		"deletion of excess pod is blocked by another controller": {
+			pods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueSchedulingGate().
+					Finalizer("kubernetes").
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now.Add(time.Minute)).
+					Delete().
+					Obj(),
+			},
+			wantPods: []corev1.Pod{
+				*basePodWrapper.
+					Clone().
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueFinalizer().
+					KueueSchedulingGate().
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now).
+					Obj(),
+				*basePodWrapper.
+					Clone().
+					Name("pod2").
+					Label("kueue.x-k8s.io/managed", "true").
+					KueueSchedulingGate().
+					Finalizer("kubernetes").
+					Group("test-group").
+					GroupTotalCount("1").
+					CreationTimestamp(now.Add(time.Minute)).
+					Delete().
+					Obj(),
+			},
+			workloads: []kueue.Workload{},
+			wantWorkloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("test-group", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+					PodSets(
+						*utiltesting.MakePodSet("b990493b", 1).
+							Request(corev1.ResourceCPU, "1").
+							SchedulingGates(corev1.PodSchedulingGate{Name: "kueue.x-k8s.io/admission"}).
+							Obj(),
+					).
+					Queue("user-queue").
+					Priority(0).
+					Obj(),
+			},
+			workloadCmpOpts: defaultWorkloadCmpOpts,
+		},
 	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			if tc.wantErrs != nil && len(tc.wantErrs) != len(tc.pods) {
+				t.Fatalf("pods and wantErrs in the test should be the same length and order")
+			}
 			ctx, _ := utiltesting.ContextWithLog(t)
 			clientBuilder := utiltesting.NewClientBuilder()
 			if err := SetupIndexes(ctx, utiltesting.AsIndexer(clientBuilder)); err != nil {
@@ -1451,13 +2097,24 @@ func TestReconciler(t *testing.T) {
 			recorder := record.NewBroadcaster().NewRecorder(kClient.Scheme(), corev1.EventSource{Component: "test"})
 			reconciler := NewReconciler(kClient, recorder)
 
-			for _, pod := range tc.pods {
-				podKey := client.ObjectKeyFromObject(&pod)
+			for i := range tc.pods {
+				podKey := client.ObjectKeyFromObject(&tc.pods[i])
+				if _, ok := tc.skipReconcileForPods[podKey.Name]; ok {
+					continue
+				}
+
 				_, err := reconciler.Reconcile(ctx, reconcile.Request{
 					NamespacedName: podKey,
 				})
 
-				if diff := cmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
+				var wantErr error
+				if tc.wantErrs == nil {
+					wantErr = nil
+				} else {
+					wantErr = tc.wantErrs[i]
+				}
+
+				if diff := cmp.Diff(wantErr, err, cmpopts.EquateErrors()); diff != "" {
 					t.Errorf("Reconcile returned error (-want,+got):\n%s", diff)
 				}
 			}
@@ -1584,7 +2241,7 @@ func TestReconciler_ErrorFinalizingPod(t *testing.T) {
 	}
 
 	// Workload should be finished after the second reconcile
-	wantWl := *utiltesting.MakeWorkload("unit-test", "ns").Finalizers(kueue.ResourceInUseFinalizerName).
+	wantWl := *utiltesting.MakeWorkload("unit-test", "ns").
 		PodSets(*utiltesting.MakePodSet(kueue.DefaultPodSetName, 1).Request(corev1.ResourceCPU, "1").Obj()).
 		ReserveQuota(utiltesting.MakeAdmission("cq").AssignmentPodCount(1).Obj()).
 		Admitted(true).

@@ -231,7 +231,13 @@ func setupControllers(mgr ctrl.Manager, cCache *cache.Cache, queues *queue.Manag
 	// setup provision admission check controller
 	if features.Enabled(features.ProvisioningACC) && provisioning.ServerSupportsProvisioningRequest(mgr) {
 		// A info message is added in setupIndexes if autoscaling is not supported by the cluster
-		if err := provisioning.NewController(mgr.GetClient(), mgr.GetEventRecorderFor("kueue-provisioning-request-controller")).SetupWithManager(mgr); err != nil {
+		ctrl, err := provisioning.NewController(mgr.GetClient(), mgr.GetEventRecorderFor("kueue-provisioning-request-controller"))
+		if err != nil {
+			setupLog.Error(err, "Could not create the provisioning controller")
+			os.Exit(1)
+		}
+
+		if err := ctrl.SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Could not setup provisioning controller")
 			os.Exit(1)
 		}
@@ -251,7 +257,6 @@ func setupControllers(mgr ctrl.Manager, cCache *cache.Cache, queues *queue.Manag
 	}
 	err := jobframework.ForEachIntegration(func(name string, cb jobframework.IntegrationCallbacks) error {
 		log := setupLog.WithValues("jobFrameworkName", name)
-
 		if isFrameworkEnabled(cfg, name) {
 			gvk, err := apiutil.GVKForObject(cb.JobType, mgr.GetScheme())
 			if err != nil {
@@ -261,7 +266,7 @@ func setupControllers(mgr ctrl.Manager, cCache *cache.Cache, queues *queue.Manag
 				if !meta.IsNoMatchError(err) {
 					return err
 				}
-				log.Info("No matching API server for job framework, skip to create controller and webhook")
+				log.Info("No matching API in the server for job framework, skipped setup of controller and webhook")
 			} else {
 				if err = cb.NewReconciler(
 					mgr.GetClient(),
@@ -290,6 +295,7 @@ func setupControllers(mgr ctrl.Manager, cCache *cache.Cache, queues *queue.Manag
 					log.Error(err, "Unable to create webhook")
 					return err
 				}
+				log.Info("Set up controller and webhook for job framework")
 				return nil
 			}
 		}

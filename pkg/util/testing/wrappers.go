@@ -26,6 +26,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta1"
@@ -99,6 +100,11 @@ func (w *WorkloadWrapper) Limit(r corev1.ResourceName, q string) *WorkloadWrappe
 
 func (w *WorkloadWrapper) Queue(q string) *WorkloadWrapper {
 	w.Spec.QueueName = q
+	return w
+}
+
+func (w *WorkloadWrapper) Active(a bool) *WorkloadWrapper {
+	w.Spec.Active = ptr.To(a)
 	return w
 }
 
@@ -203,6 +209,20 @@ func (w *WorkloadWrapper) Labels(l map[string]string) *WorkloadWrapper {
 
 func (w *WorkloadWrapper) AdmissionChecks(checks ...kueue.AdmissionCheckState) *WorkloadWrapper {
 	w.Status.AdmissionChecks = checks
+	return w
+}
+
+func (w *WorkloadWrapper) OwnerReference(apiVersion, kind, name, uid string, controller, blockDeletion bool) *WorkloadWrapper {
+	w.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         apiVersion,
+			Kind:               kind,
+			Name:               name,
+			UID:                types.UID(uid),
+			Controller:         &controller,
+			BlockOwnerDeletion: &blockDeletion,
+		},
+	}
 	return w
 }
 
@@ -475,6 +495,21 @@ func (c *ClusterQueueWrapper) Preemption(p kueue.ClusterQueuePreemption) *Cluste
 // Preemption sets the preeemption policies.
 func (c *ClusterQueueWrapper) FlavorFungibility(p kueue.FlavorFungibility) *ClusterQueueWrapper {
 	c.Spec.FlavorFungibility = &p
+	return c
+}
+
+func (c *ClusterQueueWrapper) StopPolicy(p kueue.StopPolicy) *ClusterQueueWrapper {
+	c.Spec.StopPolicy = &p
+	return c
+}
+
+func (c *ClusterQueueWrapper) Condition(conditionType string, status metav1.ConditionStatus, reason, message string) *ClusterQueueWrapper {
+	apimeta.SetStatusCondition(&c.Status.Conditions, metav1.Condition{
+		Type:    conditionType,
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
 	return c
 }
 

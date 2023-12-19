@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -194,14 +195,21 @@ func TestSchedule(t *testing.T) {
 
 		// disable partial admission
 		disablePartialAdmission bool
+
+		// ignored if empty, the Message is ignored (it contains the duration)
+		wantEvents []utiltesting.EventRecord
 	}{
-		"workload fits in single clusterQueue": {
+		"workload fits in single clusterQueue, with check state ready": {
 			workloads: []kueue.Workload{
 				*utiltesting.MakeWorkload("foo", "sales").
 					Queue("main").
 					PodSets(*utiltesting.MakePodSet("one", 10).
 						Request(corev1.ResourceCPU, "1").
 						Obj()).
+					AdmissionCheck(kueue.AdmissionCheckState{
+						Name:  "check",
+						State: kueue.CheckStateReady,
+					}).
 					Obj(),
 			},
 			wantAssignments: map[string]kueue.Admission{
@@ -222,6 +230,57 @@ func TestSchedule(t *testing.T) {
 				},
 			},
 			wantScheduled: []string{"sales/foo"},
+			wantEvents: []utiltesting.EventRecord{
+				{
+					Key:       types.NamespacedName{Namespace: "sales", Name: "foo"},
+					Reason:    "QuotaReserved",
+					EventType: corev1.EventTypeNormal,
+				},
+				{
+					Key:       types.NamespacedName{Namespace: "sales", Name: "foo"},
+					Reason:    "Admitted",
+					EventType: corev1.EventTypeNormal,
+				},
+			},
+		},
+		"workload fits in single clusterQueue, with check state pending": {
+			workloads: []kueue.Workload{
+				*utiltesting.MakeWorkload("foo", "sales").
+					Queue("main").
+					PodSets(*utiltesting.MakePodSet("one", 10).
+						Request(corev1.ResourceCPU, "1").
+						Obj()).
+					AdmissionCheck(kueue.AdmissionCheckState{
+						Name:  "check",
+						State: kueue.CheckStatePending,
+					}).
+					Obj(),
+			},
+			wantAssignments: map[string]kueue.Admission{
+				"sales/foo": {
+					ClusterQueue: "sales",
+					PodSetAssignments: []kueue.PodSetAssignment{
+						{
+							Name: "one",
+							Flavors: map[corev1.ResourceName]kueue.ResourceFlavorReference{
+								corev1.ResourceCPU: "default",
+							},
+							ResourceUsage: corev1.ResourceList{
+								corev1.ResourceCPU: resource.MustParse("10000m"),
+							},
+							Count: ptr.To[int32](10),
+						},
+					},
+				},
+			},
+			wantScheduled: []string{"sales/foo"},
+			wantEvents: []utiltesting.EventRecord{
+				{
+					Key:       types.NamespacedName{Namespace: "sales", Name: "foo"},
+					Reason:    "QuotaReserved",
+					EventType: corev1.EventTypeNormal,
+				},
+			},
 		},
 		"error during admission": {
 			workloads: []kueue.Workload{
@@ -1044,7 +1103,6 @@ func TestSchedule(t *testing.T) {
 				defer features.SetFeatureGateDuringTest(t, features.PartialAdmission, false)()
 			}
 			ctx, _ := utiltesting.ContextWithLog(t)
-			scheme := runtime.NewScheme()
 
 			allQueues := append(queues, tc.additionalLocalQueues...)
 			allClusterQueues := append(clusterQueues, tc.additionalClusterQueues...)
@@ -1058,9 +1116,7 @@ func TestSchedule(t *testing.T) {
 					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "sales", Labels: map[string]string{"dep": "sales"}}},
 				)
 			cl := clientBuilder.Build()
-			broadcaster := record.NewBroadcaster()
-			recorder := broadcaster.NewRecorder(scheme,
-				corev1.EventSource{Component: constants.AdmissionName})
+			recorder := &utiltesting.EventRecorder{}
 			cqCache := cache.New(cl)
 			qManager := queue.NewManager(cl, cqCache)
 			// Workloads are loaded into queues or clusterQueues as we add them.
@@ -1153,6 +1209,12 @@ func TestSchedule(t *testing.T) {
 			if diff := cmp.Diff(tc.wantInadmissibleLeft, qDumpInadmissible); diff != "" {
 				t.Errorf("Unexpected elements left in inadmissible workloads (-want,+got):\n%s", diff)
 			}
+
+			if len(tc.wantEvents) > 0 {
+				if diff := cmp.Diff(tc.wantEvents, recorder.RecordedEvents, cmpopts.IgnoreFields(utiltesting.EventRecord{}, "Message")); diff != "" {
+					t.Errorf("unexpected events (-want/+got):\n%s", diff)
+				}
+			}
 		})
 	}
 }
@@ -1208,7 +1270,7 @@ func TestEntryOrdering(t *testing.T) {
 			Info: workload.Info{
 				Obj: &kueue.Workload{ObjectMeta: metav1.ObjectMeta{
 					Name:              "new_high_pri",
-					CreationTimestamp: metav1.NewTime(now.Add(3 * time.Second)),
+					CreationTimestamp: metav1.NewTime(now.Add(4 * time.Second)),
 				}, Spec: kueue.WorkloadSpec{
 					Priority: ptr.To[int32](1),
 				}},
@@ -1232,7 +1294,7 @@ func TestEntryOrdering(t *testing.T) {
 				Obj: &kueue.Workload{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:              "evicted_borrowing",
-						CreationTimestamp: metav1.NewTime(now),
+						CreationTimestamp: metav1.NewTime(now.Add(time.Second)),
 					},
 					Status: kueue.WorkloadStatus{
 						Conditions: []metav1.Condition{
@@ -1273,14 +1335,33 @@ func TestEntryOrdering(t *testing.T) {
 			},
 		},
 	}
-	sort.Sort(entryOrdering(input))
-	order := make([]string, len(input))
-	for i, e := range input {
-		order[i] = e.Obj.Name
-	}
-	wantOrder := []string{"new_high_pri", "old", "recently_evicted", "new", "high_pri_borrowing", "old_borrowing", "evicted_borrowing", "new_borrowing"}
-	if diff := cmp.Diff(wantOrder, order); diff != "" {
-		t.Errorf("Unexpected order (-want,+got):\n%s", diff)
+	for _, tc := range []struct {
+		name            string
+		prioritySorting bool
+		wantOrder       []string
+	}{
+		{
+			name:            "Priority sorting is enabled (default)",
+			prioritySorting: true,
+			wantOrder:       []string{"new_high_pri", "old", "recently_evicted", "new", "high_pri_borrowing", "old_borrowing", "evicted_borrowing", "new_borrowing"},
+		},
+		{
+			name:            "Priority sorting is disabled",
+			prioritySorting: false,
+			wantOrder:       []string{"old", "recently_evicted", "new", "new_high_pri", "old_borrowing", "evicted_borrowing", "high_pri_borrowing", "new_borrowing"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Cleanup(features.SetFeatureGateDuringTest(t, features.PrioritySortingWithinCohort, tc.prioritySorting))
+			sort.Sort(entryOrdering(input))
+			order := make([]string, len(input))
+			for i, e := range input {
+				order[i] = e.Obj.Name
+			}
+			if diff := cmp.Diff(tc.wantOrder, order); diff != "" {
+				t.Errorf("%s: Unexpected order (-want,+got):\n%s", tc.name, diff)
+			}
+		})
 	}
 }
 

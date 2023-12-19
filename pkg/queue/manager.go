@@ -121,6 +121,7 @@ func (m *Manager) UpdateClusterQueue(ctx context.Context, cq *kueue.ClusterQueue
 	}
 
 	oldCohort := cqImpl.Cohort()
+	oldActive := cqImpl.Active()
 	// TODO(#8): recreate heap based on a change of queueing policy.
 	if err := cqImpl.Update(cq); err != nil {
 		return err
@@ -131,11 +132,11 @@ func (m *Manager) UpdateClusterQueue(ctx context.Context, cq *kueue.ClusterQueue
 	}
 
 	// TODO(#8): Selectively move workloads based on the exact event.
-	if m.queueAllInadmissibleWorkloadsInCohort(ctx, cqImpl) {
+	// If any workload becomes admissible or the queue becomes active.
+	if m.queueAllInadmissibleWorkloadsInCohort(ctx, cqImpl) || (!oldActive && cqImpl.Active()) {
 		m.reportPendingWorkloads(cq.Name, cqImpl)
 		m.Broadcast()
 	}
-
 	return nil
 }
 
@@ -577,6 +578,13 @@ func (m *Manager) PendingWorkloadsInfo(cqName string) []*workload.Info {
 		return nil
 	}
 	return cq.Snapshot()
+}
+
+func (m *Manager) ClusterQueueFromLocalQueue(lqName string) (string, error) {
+	if lq, ok := m.localQueues[lqName]; ok {
+		return lq.ClusterQueue, nil
+	}
+	return "", errQueueDoesNotExist
 }
 
 // UpdateSnapshot computes the new snapshot and replaces if it differs from the

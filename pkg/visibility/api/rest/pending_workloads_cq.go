@@ -19,12 +19,12 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/registry/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	v1alpha1 "sigs.k8s.io/kueue/apis/visibility/v1alpha1"
+	"sigs.k8s.io/kueue/apis/visibility/v1alpha1"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/queue"
 
@@ -67,6 +67,10 @@ func (m *pendingWorkloadsInCqREST) Get(ctx context.Context, name string, opts ru
 
 	wls := make([]v1alpha1.PendingWorkload, 0, limit)
 	pendingWorkloadsInfo := m.queueMgr.PendingWorkloadsInfo(name)
+	if pendingWorkloadsInfo == nil {
+		return nil, errors.NewNotFound(v1alpha1.Resource("clusterqueue"), name)
+	}
+
 	localQueuePositions := make(map[string]int32, 0)
 
 	for index := 0; index < int(offset+limit) && index < len(pendingWorkloadsInfo); index++ {
@@ -78,16 +82,7 @@ func (m *pendingWorkloadsInCqREST) Get(ctx context.Context, name string, opts ru
 
 		if index >= int(offset) {
 			// Add a workload to results
-			wls = append(wls, v1alpha1.PendingWorkload{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      wlInfo.Obj.Name,
-					Namespace: wlInfo.Obj.Namespace,
-				},
-				PositionInClusterQueue: int32(index),
-				Priority:               *wlInfo.Obj.Spec.Priority,
-				LocalQueueName:         queueName,
-				PositionInLocalQueue:   positionInLocalQueue,
-			})
+			wls = append(wls, *newPendingWorkload(wlInfo, positionInLocalQueue, index))
 		}
 	}
 	return &v1alpha1.PendingWorkloadsSummary{Items: wls}, nil
